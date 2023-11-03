@@ -1063,25 +1063,24 @@ func (ca *clusterAdmin) ListConsumerGroups() (allGroups map[string]string, err e
 func (ca *clusterAdmin) ListConsumerGroupOffsets(group string, topicPartitions map[string][]int32) (*OffsetFetchResponse, error) {
 	var response *OffsetFetchResponse
 	request := NewOffsetFetchRequest(ca.conf.Version, group, topicPartitions)
-	err := ca.retryOnError(isRetriableGroupCoordinatorError, func() error {
-		coordinator, err := ca.client.Coordinator(group)
-		if err != nil {
-			return err
-		}
-
+	err := ca.retryOnError(isRetriableGroupCoordinatorError, func() (err error) {
 		defer func() {
 			if err != nil && isRetriableGroupCoordinatorError(err) {
 				_ = ca.client.RefreshCoordinator(group)
 			}
 		}()
 
+		coordinator, err := ca.client.Coordinator(group)
+		if err != nil {
+			return err
+		}
+
 		response, err = coordinator.FetchOffset(request)
 		if err != nil {
 			return err
 		}
 		if !errors.Is(response.Err, ErrNoError) {
-			err = response.Err
-			return err
+			return response.Err
 		}
 
 		return nil
