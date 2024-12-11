@@ -101,6 +101,9 @@ type ClusterAdmin interface {
 	// This operation is supported by brokers with version 0.11.0.0 or higher.
 	DeleteACL(filter AclFilter, validateOnly bool) ([]MatchingAcl, error)
 
+	// ElectLeaders allows to trigger the election of preferred leaders for a set of partitions.
+	ElectLeaders(ElectionType, map[string][]int32) (map[string]map[int32]*PartitionResult, error)
+
 	// List the consumer groups available in the cluster.
 	ListConsumerGroups() (map[string]string, error)
 
