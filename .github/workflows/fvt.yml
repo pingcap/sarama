@@ -59,7 +59,7 @@ jobs:
         if [ -f "fvt-kafka-${{ inputs.kafka-version }}.pcap" ]; then sudo chmod a+r "fvt-kafka-${{ inputs.kafka-version }}.pcap"; fi
     - name: Upload pcap file
       if: always()
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: fvt-kafka-${{ inputs.kafka-version }}.pcap
         path: fvt-kafka-${{ inputs.kafka-version }}.pcap
