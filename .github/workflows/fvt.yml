@@ -44,7 +44,8 @@ jobs:
     - name: Setup Docker Compose
       run: |
         curl -sSL "https://github.com/docker/compose/releases/download/v2.20.3/docker-compose-$(uname -s)-$(uname -m)" -o /tmp/docker-compose
-        sudo install -m755 /tmp/docker-compose "$(dirname $(which docker-compose))"
+        sudo install -m755 /tmp/docker-compose /usr/local/bin/docker-compose
+        sudo chmod +x /usr/local/bin/docker-compose
         docker version --format 'Docker Engine version v{{.Server.Version}}'
         docker-compose version
     - name: Test (Functional)
