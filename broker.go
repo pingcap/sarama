@@ -437,13 +437,13 @@ type ProduceCallback func(*ProduceResponse, error)
 func (b *Broker) AsyncProduce(request *ProduceRequest, cb ProduceCallback) error {
 	b.lock.Lock()
 	defer b.lock.Unlock()
-
-  needAcks := request.RequiredAcks != NoResponse
+	needAcks := request.RequiredAcks != NoResponse
 	// Use a nil promise when no acks is required
 	var promise *responsePromise
 
 	if needAcks {
 		metricRegistry := b.metricRegistry
+
 		// Create ProduceResponse early to provide the header version
 		res := new(ProduceResponse)
 		promise = &responsePromise{
