@@ -16,6 +16,25 @@ type CreateTopicsRequest struct {
 	ValidateOnly bool
 }
 
+func (c *CreateTopicsRequest) setVersion(v int16) {
+	c.Version = v
+}
+
+func NewCreateTopicsRequest(version KafkaVersion, topicDetails map[string]*TopicDetail, timeout time.Duration) *CreateTopicsRequest {
+	r := &CreateTopicsRequest{
+		TopicDetails: topicDetails,
+		Timeout:      timeout,
+	}
+	if version.IsAtLeast(V2_0_0_0) {
+		r.Version = 3
+	} else if version.IsAtLeast(V0_11_0_0) {
+		r.Version = 2
+	} else if version.IsAtLeast(V0_10_2_0) {
+		r.Version = 1
+	}
+	return r
+}
+
 func (c *CreateTopicsRequest) encode(pe packetEncoder) error {
 	if err := pe.putArrayLength(len(c.TopicDetails)); err != nil {
 		return err
@@ -76,7 +95,7 @@ func (c *CreateTopicsRequest) decode(pd packetDecoder, version int16) (err error
 }
 
 func (c *CreateTopicsRequest) key() int16 {
-	return 19
+	return apiKeyCreateTopics
 }
 
 func (c *CreateTopicsRequest) version() int16 {
