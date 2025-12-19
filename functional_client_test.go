@@ -1,5 +1,4 @@
 //go:build functional
-// +build functional
 
 package sarama
 
@@ -14,7 +13,8 @@ func TestFuncConnectionFailure(t *testing.T) {
 	setupFunctionalTest(t)
 	defer teardownFunctionalTest(t)
 
-	FunctionalTestEnv.Proxies["kafka1"].Enabled = false
+	proxy := proxyForBrokerID(t, 1)
+	proxy.Enabled = false
 	SaveProxy(t, "kafka1")
 
 	config := NewFunctionalTestConfig()
