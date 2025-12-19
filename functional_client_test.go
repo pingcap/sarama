@@ -26,6 +26,61 @@ func TestFuncConnectionFailure(t *testing.T) {
 	}
 }
 
+func TestFuncAdminNetworkErrorClosesControllerConnection(t *testing.T) {
+	// Goal (IBM/sarama#1162): verify controller reconnection semantics after a TCP reset.
+	// Expected flow:
+	// 1) First metadata request succeeds.
+	// 2) Injected TCP reset makes the next metadata request fail.
+	// 3) Explicit Open triggers automatic reconnection and the subsequent metadata request succeeds.
+	checkKafkaVersion(t, "0.11.0.0")
+	setupFunctionalTest(t)
+	defer teardownFunctionalTest(t)
+
+	kafkaVersion, err := ParseKafkaVersion(FunctionalTestEnv.KafkaVersion)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	config := NewFunctionalTestConfig()
+	config.Version = kafkaVersion
+	adminClient, err := NewClusterAdmin(FunctionalTestEnv.KafkaBrokerAddrs, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer safeClose(t, adminClient)
+
+	controller, err := adminClient.Controller()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if controller.ID() < 0 {
+		t.Fatalf("expected controller broker ID to be resolved, got %d", controller.ID())
+	}
+
+	// Warm up the connection so the proxy toxic applies to an established TCP session.
+	metadataReq := NewMetadataRequest(config.Version, nil)
+	if _, err := controller.GetMetadata(metadataReq); err != nil {
+		t.Fatal(err)
+	}
+
+	proxy := proxyForBrokerID(t, controller.ID())
+	addResetPeerToxic(t, proxy)
+	defer resetProxies(t)
+
+	if _, err := controller.GetMetadata(metadataReq); err == nil {
+		t.Fatal("expected metadata request to fail after injected network error")
+	}
+	// Ensure the injected reset is one-shot; otherwise the proxy will continue
+	// to reset new connections and make reconnection impossible.
+	resetProxies(t)
+
+	// Trigger a reconnect path and retry. It should succeed after the automatic reconnection.
+	_ = controller.Open(config)
+	if _, err := controller.GetMetadata(metadataReq); err != nil {
+		t.Fatalf("expected metadata request to succeed after reopen, got %v", err)
+	}
+}
+
 func TestFuncClientMetadata(t *testing.T) {
 	setupFunctionalTest(t)
 	defer teardownFunctionalTest(t)
