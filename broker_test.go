@@ -11,6 +11,7 @@ import (
 
 	"github.com/jcmturner/gokrb5/v8/krberror"
 	"github.com/rcrowley/go-metrics"
+	"github.com/stretchr/testify/require"
 )
 
 func ExampleBroker() {
@@ -192,6 +193,56 @@ func TestBrokerFailedRequest(t *testing.T) {
 			}
 		})
 	}
+}
+
+// closeImmediatelyDialer is a test dialer that returns a net.Conn whose peer is
+// already closed. This reliably triggers a transport-level failure (e.g. EOF)
+// during ApiVersions negotiation in Broker.Open.
+type closeImmediatelyDialer struct{}
+
+func (closeImmediatelyDialer) Dial(_, _ string) (net.Conn, error) {
+	client, server := net.Pipe()
+	_ = server.Close()
+	return client, nil
+}
+
+func TestBrokerOpenSASLv1FailThenReopenTransportError(t *testing.T) {
+	t.Parallel()
+
+	mockBroker := NewMockBroker(t, 0)
+	defer mockBroker.Close()
+
+	mockBroker.SetHandlerByMap(map[string]MockResponse{
+		"ApiVersionsRequest":      NewMockApiVersionsResponse(t),
+		"SaslHandshakeRequest":    NewMockSaslHandshakeResponse(t).SetEnabledMechanisms([]string{SASLTypeOAuth}),
+		"SaslAuthenticateRequest": NewMockSaslAuthenticateResponse(t).SetError(ErrSASLAuthenticationFailed),
+	})
+
+	broker := NewBroker(mockBroker.Addr())
+
+	// first Open: SASL v1 auth fails after b.responses channel is created
+	conf := NewTestConfig()
+	conf.Net.SASL.Enable = true
+	conf.Net.SASL.Mechanism = SASLTypeOAuth
+	conf.Net.SASL.TokenProvider = newTokenProvider(&AccessToken{Token: "test"}, nil)
+	conf.Version = V1_0_0_0
+
+	err := broker.Open(conf)
+	require.NoError(t, err)
+
+	connected, connErr := broker.Connected()
+	require.False(t, connected)
+	require.Error(t, connErr)
+
+	// second Open with a transport error during ApiVersions must not panic
+	// with "close of closed channel"
+	conf2 := NewTestConfig()
+	conf2.ApiVersionsRequest = true
+	conf2.Net.Proxy.Enable = true
+	conf2.Net.Proxy.Dialer = closeImmediatelyDialer{}
+
+	require.NotErrorIs(t, broker.Open(conf2), ErrAlreadyConnected)
+	_, _ = broker.Connected()
 }
 
 var ErrTokenFailure = errors.New("Failure generating token")
