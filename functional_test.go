@@ -166,6 +166,16 @@ func prepareDockerTestEnvironment(ctx context.Context, env *testEnvironment) err
 	c.Env = append(os.Environ(), fmt.Sprintf("KAFKA_VERSION=%s", env.KafkaVersion))
 	err := c.Run()
 	if err != nil {
+		for _, args := range [][]string{
+			{"ps"},
+			{"logs", "-t", "zookeeper-1", "zookeeper-2", "zookeeper-3", "kafka-1", "kafka-2", "kafka-3", "kafka-4", "kafka-5", "toxiproxy"},
+		} {
+			diag := exec.Command("docker-compose", args...)
+			diag.Stdout = os.Stdout
+			diag.Stderr = os.Stderr
+			diag.Env = append(os.Environ(), fmt.Sprintf("KAFKA_VERSION=%s", env.KafkaVersion))
+			_ = diag.Run()
+		}
 		return fmt.Errorf("failed to run docker-compose to start test environment: %w", err)
 	}
 
