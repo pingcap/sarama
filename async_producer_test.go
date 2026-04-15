@@ -1802,7 +1802,9 @@ func TestBrokerProducerWaitForSpaceAllPartitionsMuted(t *testing.T) {
 
 	assertNotDone(t, done, 50*time.Millisecond)
 	parent.muter.unmute(blockedSet)
-	assertDoneWithin(t, done, 2*time.Second)
+	if err := assertDoneWithin(t, done, 2*time.Second); err != nil {
+		t.Fatalf("expected nil error, got %v", err)
+	}
 }
 
 // TestPartitionMuterCloseWakesWaitUntilMuted verifies that closing the muter wakes
