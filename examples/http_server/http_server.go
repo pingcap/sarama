@@ -50,13 +50,13 @@ func main() {
 		DataCollector:     newDataCollector(brokerList, version),
 		AccessLogProducer: newAccessLogProducer(brokerList, version),
 	}
-	runErr := server.Run(*addr)
-	if err := server.Close(); err != nil {
-		log.Println("Failed to close server", err)
-	}
-	if runErr != nil {
-		log.Fatal(runErr)
-	}
+	defer func() {
+		if err := server.Close(); err != nil {
+			log.Println("Failed to close server", err)
+		}
+	}()
+
+	log.Fatal(server.Run(*addr))
 }
 
 func createTlsConfiguration() (t *tls.Config) {
@@ -77,7 +77,7 @@ func createTlsConfiguration() (t *tls.Config) {
 		t = &tls.Config{
 			Certificates:       []tls.Certificate{cert},
 			RootCAs:            caCertPool,
-			InsecureSkipVerify: *tlsSkipVerify, // #nosec G402 -- example CLI intentionally exposes tls-skip-verify.
+			InsecureSkipVerify: *tlsSkipVerify,
 		}
 	}
 	// will be nil by default if nothing is provided
@@ -107,9 +107,8 @@ func (s *Server) Handler() http.Handler {
 
 func (s *Server) Run(addr string) error {
 	httpServer := &http.Server{
-		Addr:              addr,
-		Handler:           s.Handler(),
-		ReadHeaderTimeout: 5 * time.Second,
+		Addr:    addr,
+		Handler: s.Handler(),
 	}
 
 	log.Printf("Listening for requests on %s...\n", addr)
