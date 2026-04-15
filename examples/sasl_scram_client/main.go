@@ -12,7 +12,7 @@ import (
 	"github.com/IBM/sarama"
 )
 
-func configureSaramaLogger() {
+func init() {
 	sarama.Logger = log.New(os.Stdout, "[Sarama] ", log.LstdFlags)
 }
 
@@ -36,7 +36,7 @@ var (
 
 func createTLSConfiguration() (t *tls.Config) {
 	t = &tls.Config{
-		InsecureSkipVerify: *tlsSkipVerify, // #nosec G402 -- example CLI intentionally exposes tls-skip-verify.
+		InsecureSkipVerify: *tlsSkipVerify,
 	}
 	if *certFile != "" && *keyFile != "" && *caFile != "" {
 		cert, err := tls.LoadX509KeyPair(*certFile, *keyFile)
@@ -55,14 +55,13 @@ func createTLSConfiguration() (t *tls.Config) {
 		t = &tls.Config{
 			Certificates:       []tls.Certificate{cert},
 			RootCAs:            caCertPool,
-			InsecureSkipVerify: *tlsSkipVerify, // #nosec G402 -- example CLI intentionally exposes tls-skip-verify.
+			InsecureSkipVerify: *tlsSkipVerify,
 		}
 	}
 	return t
 }
 
 func main() {
-	configureSaramaLogger()
 	flag.Parse()
 
 	if *brokers == "" {
