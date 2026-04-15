@@ -33,6 +33,13 @@ RUN cd /tmp \
  && for DIR in /opt/kafka-*; do cp -v jaxb-api-2.3.0.jar $DIR/libs/ ; done \
  && rm -f jaxb-api-2.3.0.jar
 
+# older kafka versions ship with zookeeper 3.4.x clients that are flaky on modern
+# runners, so replace them with the API-compatible 3.5.9 release used by newer kafka
+RUN if ! stat /opt/kafka-${KAFKA_VERSION}/libs/zookeeper-3.4.*.jar; then exit 0; fi ; \
+    rm -f /opt/kafka-${KAFKA_VERSION}/libs/zookeeper-3.4.*.jar \
+ && curl --fail -sSL -o "/opt/kafka-${KAFKA_VERSION}/libs/zookeeper-3.5.9.jar" "https://repo1.maven.org/maven2/org/apache/zookeeper/zookeeper/3.5.9/zookeeper-3.5.9.jar" \
+ && curl --fail -sSL -o "/opt/kafka-${KAFKA_VERSION}/libs/zookeeper-jute-3.5.9.jar" "https://repo1.maven.org/maven2/org/apache/zookeeper/zookeeper-jute/3.5.9/zookeeper-jute-3.5.9.jar"
+
 WORKDIR /opt/kafka-${KAFKA_VERSION}
 
 ENV JAVA_MAJOR_VERSION=11

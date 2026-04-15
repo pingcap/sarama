@@ -5,7 +5,7 @@ on:
       go-version:
         required: false
         type: string
-        default: 1.21.x
+        default: stable
       kafka-version:
         required: false
         type: string
@@ -14,6 +14,10 @@ on:
         required: false
         type: string
         default: 2.13
+
+env:
+  GOTOOLCHAIN: local
+
 jobs:
   fvt:
     name: Test with Kafka ${{ inputs.kafka-version }}

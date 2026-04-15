@@ -5,13 +5,17 @@ on:
     - "**"
     paths-ignore:
     - '**/*.md'
+
+env:
+  GOTOOLCHAIN: local
+
 jobs:
   fvt:
     name: Test with Kafka ${{ matrix.kafka-version }}
     strategy:
       fail-fast: false
       matrix:
-        go-version: [1.21.x]
+        go-version: [stable]
         kafka-version: [1.0.2, 2.6.2, 3.5.1]
         include:
         - kafka-version: 1.0.2
