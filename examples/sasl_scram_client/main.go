@@ -12,12 +12,13 @@ import (
 	"github.com/IBM/sarama"
 )
 
-func init() {
+func configureSaramaLogger() {
 	sarama.Logger = log.New(os.Stdout, "[Sarama] ", log.LstdFlags)
 }
 
 var (
 	brokers       = flag.String("brokers", os.Getenv("KAFKA_PEERS"), "The Kafka brokers to connect to, as a comma separated list")
+	version       = flag.String("version", sarama.DefaultVersion.String(), "Kafka cluster version")
 	userName      = flag.String("username", "", "The SASL username")
 	passwd        = flag.String("passwd", "", "The SASL password")
 	algorithm     = flag.String("algorithm", "", "The SASL SCRAM SHA algorithm sha256 or sha512 as mechanism")
@@ -35,7 +36,7 @@ var (
 
 func createTLSConfiguration() (t *tls.Config) {
 	t = &tls.Config{
-		InsecureSkipVerify: *tlsSkipVerify,
+		InsecureSkipVerify: *tlsSkipVerify, // #nosec G402 -- example CLI intentionally exposes tls-skip-verify.
 	}
 	if *certFile != "" && *keyFile != "" && *caFile != "" {
 		cert, err := tls.LoadX509KeyPair(*certFile, *keyFile)
@@ -54,19 +55,25 @@ func createTLSConfiguration() (t *tls.Config) {
 		t = &tls.Config{
 			Certificates:       []tls.Certificate{cert},
 			RootCAs:            caCertPool,
-			InsecureSkipVerify: *tlsSkipVerify,
+			InsecureSkipVerify: *tlsSkipVerify, // #nosec G402 -- example CLI intentionally exposes tls-skip-verify.
 		}
 	}
 	return t
 }
 
 func main() {
+	configureSaramaLogger()
 	flag.Parse()
 
 	if *brokers == "" {
 		log.Fatalln("at least one broker is required")
 	}
 	splitBrokers := strings.Split(*brokers, ",")
+
+	version, err := sarama.ParseKafkaVersion(*version)
+	if err != nil {
+		log.Panicf("Error parsing Kafka version: %v", err)
+	}
 
 	if *userName == "" {
 		log.Fatalln("SASL username is required")
@@ -80,8 +87,7 @@ func main() {
 	conf.Producer.Retry.Max = 1
 	conf.Producer.RequiredAcks = sarama.WaitForAll
 	conf.Producer.Return.Successes = true
-	conf.Metadata.Full = true
-	conf.Version = sarama.V0_10_0_0
+	conf.Version = version
 	conf.ClientID = "sasl_scram_client"
 	conf.Metadata.Full = true
 	conf.Net.SASL.Enable = true
@@ -94,7 +100,6 @@ func main() {
 	} else if *algorithm == "sha256" {
 		conf.Net.SASL.SCRAMClientGeneratorFunc = func() sarama.SCRAMClient { return &XDGSCRAMClient{HashGeneratorFcn: SHA256} }
 		conf.Net.SASL.Mechanism = sarama.SASLTypeSCRAMSHA256
-
 	} else {
 		log.Fatalf("invalid SHA algorithm \"%s\": can be either \"sha256\" or \"sha512\"", *algorithm)
 	}
@@ -148,7 +153,6 @@ func main() {
 		}
 
 		log.Printf("Consumed: %d\n", consumed)
-
 	} else {
 		syncProducer, err := sarama.NewSyncProducer(splitBrokers, conf)
 		if err != nil {

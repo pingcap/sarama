@@ -18,6 +18,7 @@ import (
 var (
 	addr          = flag.String("addr", ":8080", "The address to bind to")
 	brokers       = flag.String("brokers", os.Getenv("KAFKA_PEERS"), "The Kafka brokers to connect to, as a comma separated list")
+	version       = flag.String("version", sarama.DefaultVersion.String(), "Kafka cluster version")
 	verbose       = flag.Bool("verbose", false, "Turn on Sarama logging")
 	certFile      = flag.String("certificate", "", "The optional certificate file for client authentication")
 	keyFile       = flag.String("key", "", "The optional key file for client authentication")
@@ -40,17 +41,22 @@ func main() {
 	brokerList := strings.Split(*brokers, ",")
 	log.Printf("Kafka brokers: %s", strings.Join(brokerList, ", "))
 
-	server := &Server{
-		DataCollector:     newDataCollector(brokerList),
-		AccessLogProducer: newAccessLogProducer(brokerList),
+	version, err := sarama.ParseKafkaVersion(*version)
+	if err != nil {
+		log.Panicf("Error parsing Kafka version: %v", err)
 	}
-	defer func() {
-		if err := server.Close(); err != nil {
-			log.Println("Failed to close server", err)
-		}
-	}()
 
-	log.Fatal(server.Run(*addr))
+	server := &Server{
+		DataCollector:     newDataCollector(brokerList, version),
+		AccessLogProducer: newAccessLogProducer(brokerList, version),
+	}
+	runErr := server.Run(*addr)
+	if err := server.Close(); err != nil {
+		log.Println("Failed to close server", err)
+	}
+	if runErr != nil {
+		log.Fatal(runErr)
+	}
 }
 
 func createTlsConfiguration() (t *tls.Config) {
@@ -71,7 +77,7 @@ func createTlsConfiguration() (t *tls.Config) {
 		t = &tls.Config{
 			Certificates:       []tls.Certificate{cert},
 			RootCAs:            caCertPool,
-			InsecureSkipVerify: *tlsSkipVerify,
+			InsecureSkipVerify: *tlsSkipVerify, // #nosec G402 -- example CLI intentionally exposes tls-skip-verify.
 		}
 	}
 	// will be nil by default if nothing is provided
@@ -101,8 +107,9 @@ func (s *Server) Handler() http.Handler {
 
 func (s *Server) Run(addr string) error {
 	httpServer := &http.Server{
-		Addr:    addr,
-		Handler: s.Handler(),
+		Addr:              addr,
+		Handler:           s.Handler(),
+		ReadHeaderTimeout: 5 * time.Second,
 	}
 
 	log.Printf("Listening for requests on %s...\n", addr)
@@ -186,11 +193,12 @@ func (s *Server) withAccessLog(next http.Handler) http.Handler {
 	})
 }
 
-func newDataCollector(brokerList []string) sarama.SyncProducer {
+func newDataCollector(brokerList []string, version sarama.KafkaVersion) sarama.SyncProducer {
 	// For the data collector, we are looking for strong consistency semantics.
 	// Because we don't change the flush settings, sarama will try to produce messages
 	// as fast as possible to keep latency low.
 	config := sarama.NewConfig()
+	config.Version = version
 	config.Producer.RequiredAcks = sarama.WaitForAll // Wait for all in-sync replicas to ack the message
 	config.Producer.Retry.Max = 10                   // Retry up to 10 times to produce the message
 	config.Producer.Return.Successes = true
@@ -213,10 +221,11 @@ func newDataCollector(brokerList []string) sarama.SyncProducer {
 	return producer
 }
 
-func newAccessLogProducer(brokerList []string) sarama.AsyncProducer {
+func newAccessLogProducer(brokerList []string, version sarama.KafkaVersion) sarama.AsyncProducer {
 	// For the access log, we are looking for AP semantics, with high throughput.
 	// By creating batches of compressed messages, we reduce network I/O at a cost of more latency.
 	config := sarama.NewConfig()
+	config.Version = version
 	tlsConfig := createTlsConfiguration()
 	if tlsConfig != nil {
 		config.Net.TLS.Enable = true
