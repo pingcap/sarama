@@ -182,7 +182,7 @@ outerFor:
 		t.Errorf("clientRetries = %v; want > 1", clientRetries)
 	}
 
-	if err != nil && !errors.Is(err, context.DeadlineExceeded) {
+	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatal(err)
 	}
 
