@@ -14,6 +14,7 @@ import (
 
 	"github.com/fortytw2/leaktest"
 	"github.com/rcrowley/go-metrics"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
