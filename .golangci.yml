@@ -84,7 +84,7 @@ linters:
     paths:
     - third_party$
     - builtin$
-    - (^|/)examples($|/)
+    - examples$
 issues:
   # maximum count of issues with the same text. set to 0 for unlimited. default is 3.
   max-same-issues: 0
@@ -101,4 +101,4 @@ formatters:
     paths:
     - third_party$
     - builtin$
-    - (^|/)examples($|/)
+    - examples$
