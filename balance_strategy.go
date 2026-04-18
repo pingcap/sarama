@@ -4,6 +4,7 @@ import (
 	"container/heap"
 	"errors"
 	"fmt"
+	"maps"
 	"math"
 	"sort"
 	"strings"
@@ -331,10 +332,8 @@ func (s *stickyBalanceStrategy) balance(currentAssignment map[string][]topicPart
 	// make sure we are getting a more balanced assignment; otherwise, revert to previous assignment
 	if !initializing && reassignmentPerformed && getBalanceScore(currentAssignment) >= getBalanceScore(preBalanceAssignment) {
 		currentAssignment = deepCopyAssignment(preBalanceAssignment)
-		currentPartitionConsumer = make(map[topicPartitionAssignment]string, len(preBalancePartitionConsumers))
-		for k, v := range preBalancePartitionConsumers {
-			currentPartitionConsumer[k] = v
-		}
+		clear(currentPartitionConsumer)
+		maps.Copy(currentPartitionConsumer, preBalancePartitionConsumers)
 	}
 
 	// add the fixed assignments (those that could not change) back
