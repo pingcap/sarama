@@ -26,7 +26,6 @@ func (r *DescribeLogDirsRequest) encode(pe packetEncoder) error {
 		// In order to query all topics we must send null
 		length = -1
 	}
-
 	if err := pe.putArrayLength(length); err != nil {
 		return err
 	}
@@ -39,8 +38,10 @@ func (r *DescribeLogDirsRequest) encode(pe packetEncoder) error {
 		if err := pe.putInt32Array(d.PartitionIDs); err != nil {
 			return err
 		}
+		pe.putEmptyTaggedFieldArray()
 	}
 
+	pe.putEmptyTaggedFieldArray()
 	return nil
 }
 
@@ -68,10 +69,15 @@ func (r *DescribeLogDirsRequest) decode(pd packetDecoder, version int16) error {
 			return err
 		}
 		topics[i].PartitionIDs = pIDs
+		_, err = pd.getEmptyTaggedFieldArray()
+		if err != nil {
+			return err
+		}
 	}
 	r.DescribeTopics = topics
 
-	return nil
+	_, err = pd.getEmptyTaggedFieldArray()
+	return err
 }
 
 func (r *DescribeLogDirsRequest) key() int16 {
@@ -88,6 +94,14 @@ func (r *DescribeLogDirsRequest) headerVersion() int16 {
 
 func (r *DescribeLogDirsRequest) isValidVersion() bool {
 	return r.Version >= 0 && r.Version <= 1
+}
+
+func (r *DescribeLogDirsRequest) isFlexible() bool {
+	return r.isFlexibleVersion(r.Version)
+}
+
+func (r *DescribeLogDirsRequest) isFlexibleVersion(version int16) bool {
+	return version >= 2
 }
 
 func (r *DescribeLogDirsRequest) requiredVersion() KafkaVersion {
