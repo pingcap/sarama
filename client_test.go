@@ -1,3 +1,5 @@
+//go:build !functional
+
 package sarama
 
 import (
@@ -13,14 +15,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
-
-func safeClose(t testing.TB, c io.Closer) {
-	t.Helper()
-	err := c.Close()
-	if err != nil {
-		t.Error(err)
-	}
-}
 
 func TestSimpleClient(t *testing.T) {
 	seedBroker := NewMockBroker(t, 1)
