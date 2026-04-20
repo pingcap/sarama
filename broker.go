@@ -56,6 +56,7 @@ type Broker struct {
 	brokerRequestsInFlight     metrics.Counter
 	brokerThrottleTime         metrics.Histogram
 	brokerProtocolRequestsRate map[int16]metrics.Meter
+	brokerAPIVersions          apiVersionMap
 
 	kerberosAuthenticator               GSSAPIKerberosAuth
 	clientSessionReauthenticationTimeMs int64
@@ -175,8 +176,6 @@ func (b *Broker) Open(conf *Config) error {
 		return err
 	}
 
-	usingApiVersionsRequests := conf.Version.IsAtLeast(V2_4_0_0) && conf.ApiVersionsRequest
-
 	b.lock.Lock()
 
 	if b.metricRegistry == nil {
@@ -184,23 +183,8 @@ func (b *Broker) Open(conf *Config) error {
 	}
 
 	go withRecover(func() {
-		defer func() {
-			b.lock.Unlock()
+		defer b.lock.Unlock()
 
-			// Send an ApiVersionsRequest to identify the client (KIP-511).
-			// Ideally Sarama would use the response to control protocol versions,
-			// but for now just fire-and-forget just to send
-			if usingApiVersionsRequests {
-				_, err = b.ApiVersions(&ApiVersionsRequest{
-					Version:               3,
-					ClientSoftwareName:    defaultClientSoftwareName,
-					ClientSoftwareVersion: version(),
-				})
-				if err != nil {
-					Logger.Printf("Error while sending ApiVersionsRequest to broker %s: %s\n", b.addr, err)
-				}
-			}
-		}()
 		dialer := conf.getDialer()
 		b.conn, b.connErr = dialer.Dial("tcp", b.addr)
 		if b.connErr != nil {
@@ -1083,6 +1067,11 @@ func (b *Broker) sendWithPromise(rb protocolBody, promise *responsePromise) erro
 
 // b.lock must be held by caller
 func (b *Broker) sendInternal(rb protocolBody, promise *responsePromise) error {
+	// try restricting API version to ranges advertised by the broker
+	if err := restrictApiVersion(rb, b.brokerAPIVersions); err != nil {
+		return err
+	}
+
 	if !b.conf.Version.IsAtLeast(rb.requiredVersion()) {
 		return ErrUnsupportedVersion
 	}
