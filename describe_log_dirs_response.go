@@ -18,7 +18,6 @@ func (r *DescribeLogDirsResponse) setVersion(v int16) {
 
 func (r *DescribeLogDirsResponse) encode(pe packetEncoder) error {
 	pe.putInt32(int32(r.ThrottleTime / time.Millisecond))
-
 	if err := pe.putArrayLength(len(r.LogDirs)); err != nil {
 		return err
 	}
@@ -28,7 +27,7 @@ func (r *DescribeLogDirsResponse) encode(pe packetEncoder) error {
 			return err
 		}
 	}
-
+	pe.putEmptyTaggedFieldArray()
 	return nil
 }
 
@@ -54,7 +53,8 @@ func (r *DescribeLogDirsResponse) decode(pd packetDecoder, version int16) error 
 		r.LogDirs[i] = dir
 	}
 
-	return nil
+	_, err = pd.getEmptyTaggedFieldArray()
+	return err
 }
 
 func (r *DescribeLogDirsResponse) key() int16 {
@@ -71,6 +71,14 @@ func (r *DescribeLogDirsResponse) headerVersion() int16 {
 
 func (r *DescribeLogDirsResponse) isValidVersion() bool {
 	return r.Version >= 0 && r.Version <= 1
+}
+
+func (r *DescribeLogDirsResponse) isFlexible() bool {
+	return r.isFlexibleVersion(r.Version)
+}
+
+func (r *DescribeLogDirsResponse) isFlexibleVersion(version int16) bool {
+	return version >= 2
 }
 
 func (r *DescribeLogDirsResponse) requiredVersion() KafkaVersion {
@@ -107,7 +115,7 @@ func (r *DescribeLogDirsResponseDirMetadata) encode(pe packetEncoder) error {
 			return err
 		}
 	}
-
+	pe.putEmptyTaggedFieldArray()
 	return nil
 }
 
@@ -141,7 +149,8 @@ func (r *DescribeLogDirsResponseDirMetadata) decode(pd packetDecoder, version in
 		r.Topics[i] = t
 	}
 
-	return nil
+	_, err = pd.getEmptyTaggedFieldArray()
+	return err
 }
 
 // DescribeLogDirsResponseTopic contains a topic's partitions descriptions
@@ -154,7 +163,6 @@ func (r *DescribeLogDirsResponseTopic) encode(pe packetEncoder) error {
 	if err := pe.putString(r.Topic); err != nil {
 		return err
 	}
-
 	if err := pe.putArrayLength(len(r.Partitions)); err != nil {
 		return err
 	}
@@ -163,7 +171,7 @@ func (r *DescribeLogDirsResponseTopic) encode(pe packetEncoder) error {
 			return err
 		}
 	}
-
+	pe.putEmptyTaggedFieldArray()
 	return nil
 }
 
@@ -187,7 +195,8 @@ func (r *DescribeLogDirsResponseTopic) decode(pd packetDecoder, version int16) e
 		r.Partitions[i] = p
 	}
 
-	return nil
+	_, err = pd.getEmptyTaggedFieldArray()
+	return err
 }
 
 // DescribeLogDirsResponsePartition describes a partition's log directory
@@ -211,7 +220,7 @@ func (r *DescribeLogDirsResponsePartition) encode(pe packetEncoder) error {
 	pe.putInt64(r.Size)
 	pe.putInt64(r.OffsetLag)
 	pe.putBool(r.IsTemporary)
-
+	pe.putEmptyTaggedFieldArray()
 	return nil
 }
 
@@ -240,5 +249,6 @@ func (r *DescribeLogDirsResponsePartition) decode(pd packetDecoder, version int1
 	}
 	r.IsTemporary = isTemp
 
-	return nil
+	_, err = pd.getEmptyTaggedFieldArray()
+	return err
 }

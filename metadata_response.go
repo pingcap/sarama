@@ -44,43 +44,25 @@ func (p *PartitionMetadata) decode(pd packetDecoder, version int16) (err error) 
 		}
 	}
 
-	if p.Version < 9 {
-		p.Replicas, err = pd.getInt32Array()
-	} else {
-		p.Replicas, err = pd.getCompactInt32Array()
-	}
+	p.Replicas, err = pd.getInt32Array()
 	if err != nil {
 		return err
 	}
 
-	if p.Version < 9 {
-		p.Isr, err = pd.getInt32Array()
-	} else {
-		p.Isr, err = pd.getCompactInt32Array()
-	}
+	p.Isr, err = pd.getInt32Array()
 	if err != nil {
 		return err
 	}
 
 	if p.Version >= 5 {
-		if p.Version < 9 {
-			p.OfflineReplicas, err = pd.getInt32Array()
-		} else {
-			p.OfflineReplicas, err = pd.getCompactInt32Array()
-		}
+		p.OfflineReplicas, err = pd.getInt32Array()
 		if err != nil {
 			return err
 		}
 	}
 
-	if p.Version >= 9 {
-		_, err = pd.getEmptyTaggedFieldArray()
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
+	_, err = pd.getEmptyTaggedFieldArray()
+	return err
 }
 
 func (p *PartitionMetadata) encode(pe packetEncoder, version int16) (err error) {
@@ -95,39 +77,24 @@ func (p *PartitionMetadata) encode(pe packetEncoder, version int16) (err error) 
 		pe.putInt32(p.LeaderEpoch)
 	}
 
-	if p.Version < 9 {
-		err = pe.putInt32Array(p.Replicas)
-	} else {
-		err = pe.putCompactInt32Array(p.Replicas)
-	}
+	err = pe.putInt32Array(p.Replicas)
 	if err != nil {
 		return err
 	}
 
-	if p.Version < 9 {
-		err = pe.putInt32Array(p.Isr)
-	} else {
-		err = pe.putCompactInt32Array(p.Isr)
-	}
+	err = pe.putInt32Array(p.Isr)
 	if err != nil {
 		return err
 	}
 
 	if p.Version >= 5 {
-		if p.Version < 9 {
-			err = pe.putInt32Array(p.OfflineReplicas)
-		} else {
-			err = pe.putCompactInt32Array(p.OfflineReplicas)
-		}
+		err = pe.putInt32Array(p.OfflineReplicas)
 		if err != nil {
 			return err
 		}
 	}
 
-	if p.Version >= 9 {
-		pe.putEmptyTaggedFieldArray()
-	}
-
+	pe.putEmptyTaggedFieldArray()
 	return nil
 }
 
@@ -155,11 +122,7 @@ func (t *TopicMetadata) decode(pd packetDecoder, version int16) (err error) {
 	}
 	t.Err = KError(tmp)
 
-	if t.Version < 9 {
-		t.Name, err = pd.getString()
-	} else {
-		t.Name, err = pd.getCompactString()
-	}
+	t.Name, err = pd.getString()
 	if err != nil {
 		return err
 	}
@@ -182,23 +145,17 @@ func (t *TopicMetadata) decode(pd packetDecoder, version int16) (err error) {
 		}
 	}
 
-	var n int
-	if t.Version < 9 {
-		n, err = pd.getArrayLength()
-	} else {
-		n, err = pd.getCompactArrayLength()
-	}
+	n, err := pd.getArrayLength()
 	if err != nil {
 		return err
-	} else {
-		t.Partitions = make([]*PartitionMetadata, n)
-		for i := 0; i < n; i++ {
-			block := &PartitionMetadata{}
-			if err := block.decode(pd, t.Version); err != nil {
-				return err
-			}
-			t.Partitions[i] = block
+	}
+	t.Partitions = make([]*PartitionMetadata, n)
+	for i := 0; i < n; i++ {
+		block := &PartitionMetadata{}
+		if err := block.decode(pd, t.Version); err != nil {
+			return err
 		}
+		t.Partitions[i] = block
 	}
 
 	if t.Version >= 8 {
@@ -208,25 +165,15 @@ func (t *TopicMetadata) decode(pd packetDecoder, version int16) (err error) {
 		}
 	}
 
-	if t.Version >= 9 {
-		_, err = pd.getEmptyTaggedFieldArray()
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
+	_, err = pd.getEmptyTaggedFieldArray()
+	return err
 }
 
 func (t *TopicMetadata) encode(pe packetEncoder, version int16) (err error) {
 	t.Version = version
 	pe.putInt16(int16(t.Err))
 
-	if t.Version < 9 {
-		err = pe.putString(t.Name)
-	} else {
-		err = pe.putCompactString(t.Name)
-	}
+	err = pe.putString(t.Name)
 	if err != nil {
 		return err
 	}
@@ -242,13 +189,9 @@ func (t *TopicMetadata) encode(pe packetEncoder, version int16) (err error) {
 		pe.putBool(t.IsInternal)
 	}
 
-	if t.Version < 9 {
-		err = pe.putArrayLength(len(t.Partitions))
-		if err != nil {
-			return err
-		}
-	} else {
-		pe.putCompactArrayLength(len(t.Partitions))
+	err = pe.putArrayLength(len(t.Partitions))
+	if err != nil {
+		return err
 	}
 	for _, block := range t.Partitions {
 		if err := block.encode(pe, t.Version); err != nil {
@@ -260,10 +203,7 @@ func (t *TopicMetadata) encode(pe packetEncoder, version int16) (err error) {
 		pe.putInt32(t.TopicAuthorizedOperations)
 	}
 
-	if t.Version >= 9 {
-		pe.putEmptyTaggedFieldArray()
-	}
-
+	pe.putEmptyTaggedFieldArray()
 	return nil
 }
 
@@ -295,12 +235,7 @@ func (r *MetadataResponse) decode(pd packetDecoder, version int16) (err error) {
 		}
 	}
 
-	var brokerArrayLen int
-	if r.Version < 9 {
-		brokerArrayLen, err = pd.getArrayLength()
-	} else {
-		brokerArrayLen, err = pd.getCompactArrayLength()
-	}
+	brokerArrayLen, err := pd.getArrayLength()
 	if err != nil {
 		return err
 	}
@@ -315,11 +250,7 @@ func (r *MetadataResponse) decode(pd packetDecoder, version int16) (err error) {
 	}
 
 	if r.Version >= 2 {
-		if r.Version < 9 {
-			r.ClusterID, err = pd.getNullableString()
-		} else {
-			r.ClusterID, err = pd.getCompactNullableString()
-		}
+		r.ClusterID, err = pd.getNullableString()
 		if err != nil {
 			return err
 		}
@@ -331,12 +262,7 @@ func (r *MetadataResponse) decode(pd packetDecoder, version int16) (err error) {
 		}
 	}
 
-	var topicArrayLen int
-	if version < 9 {
-		topicArrayLen, err = pd.getArrayLength()
-	} else {
-		topicArrayLen, err = pd.getCompactArrayLength()
-	}
+	topicArrayLen, err := pd.getArrayLength()
 	if err != nil {
 		return err
 	}
@@ -357,14 +283,8 @@ func (r *MetadataResponse) decode(pd packetDecoder, version int16) (err error) {
 		}
 	}
 
-	if r.Version >= 9 {
-		_, err := pd.getEmptyTaggedFieldArray()
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
+	_, err = pd.getEmptyTaggedFieldArray()
+	return err
 }
 
 func (r *MetadataResponse) encode(pe packetEncoder) (err error) {
@@ -372,13 +292,9 @@ func (r *MetadataResponse) encode(pe packetEncoder) (err error) {
 		pe.putInt32(r.ThrottleTimeMs)
 	}
 
-	if r.Version < 9 {
-		err = pe.putArrayLength(len(r.Brokers))
-		if err != nil {
-			return err
-		}
-	} else {
-		pe.putCompactArrayLength(len(r.Brokers))
+	err = pe.putArrayLength(len(r.Brokers))
+	if err != nil {
+		return err
 	}
 
 	for _, broker := range r.Brokers {
@@ -389,16 +305,9 @@ func (r *MetadataResponse) encode(pe packetEncoder) (err error) {
 	}
 
 	if r.Version >= 2 {
-		if r.Version < 9 {
-			err = pe.putNullableString(r.ClusterID)
-			if err != nil {
-				return err
-			}
-		} else {
-			err = pe.putNullableCompactString(r.ClusterID)
-			if err != nil {
-				return err
-			}
+		err = pe.putNullableString(r.ClusterID)
+		if err != nil {
+			return err
 		}
 	}
 
@@ -406,11 +315,7 @@ func (r *MetadataResponse) encode(pe packetEncoder) (err error) {
 		pe.putInt32(r.ControllerID)
 	}
 
-	if r.Version < 9 {
-		err = pe.putArrayLength(len(r.Topics))
-	} else {
-		pe.putCompactArrayLength(len(r.Topics))
-	}
+	err = pe.putArrayLength(len(r.Topics))
 	if err != nil {
 		return err
 	}
@@ -424,10 +329,7 @@ func (r *MetadataResponse) encode(pe packetEncoder) (err error) {
 		pe.putInt32(r.ClusterAuthorizedOperations)
 	}
 
-	if r.Version >= 9 {
-		pe.putEmptyTaggedFieldArray()
-	}
-
+	pe.putEmptyTaggedFieldArray()
 	return nil
 }
 
@@ -449,6 +351,14 @@ func (r *MetadataResponse) headerVersion() int16 {
 
 func (r *MetadataResponse) isValidVersion() bool {
 	return r.Version >= 0 && r.Version <= 7
+}
+
+func (r *MetadataResponse) isFlexible() bool {
+	return r.isFlexibleVersion(r.Version)
+}
+
+func (r *MetadataResponse) isFlexibleVersion(version int16) bool {
+	return version >= 9
 }
 
 func (r *MetadataResponse) requiredVersion() KafkaVersion {

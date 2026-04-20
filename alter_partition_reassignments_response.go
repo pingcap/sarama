@@ -9,7 +9,7 @@ type alterPartitionReassignmentsErrorBlock struct {
 
 func (b *alterPartitionReassignmentsErrorBlock) encode(pe packetEncoder) error {
 	pe.putInt16(int16(b.errorCode))
-	if err := pe.putNullableCompactString(b.errorMessage); err != nil {
+	if err := pe.putNullableString(b.errorMessage); err != nil {
 		return err
 	}
 	pe.putEmptyTaggedFieldArray()
@@ -23,11 +23,12 @@ func (b *alterPartitionReassignmentsErrorBlock) decode(pd packetDecoder) (err er
 		return err
 	}
 	b.errorCode = KError(errorCode)
-	b.errorMessage, err = pd.getCompactNullableString()
-
-	if _, err := pd.getEmptyTaggedFieldArray(); err != nil {
+	b.errorMessage, err = pd.getNullableString()
+	if err != nil {
 		return err
 	}
+
+	_, err = pd.getEmptyTaggedFieldArray()
 	return err
 }
 
@@ -59,16 +60,20 @@ func (r *AlterPartitionReassignmentsResponse) AddError(topic string, partition i
 func (r *AlterPartitionReassignmentsResponse) encode(pe packetEncoder) error {
 	pe.putInt32(r.ThrottleTimeMs)
 	pe.putInt16(int16(r.ErrorCode))
-	if err := pe.putNullableCompactString(r.ErrorMessage); err != nil {
+	if err := pe.putNullableString(r.ErrorMessage); err != nil {
 		return err
 	}
 
-	pe.putCompactArrayLength(len(r.Errors))
+	if err := pe.putArrayLength(len(r.Errors)); err != nil {
+		return err
+	}
 	for topic, partitions := range r.Errors {
-		if err := pe.putCompactString(topic); err != nil {
+		if err := pe.putString(topic); err != nil {
 			return err
 		}
-		pe.putCompactArrayLength(len(partitions))
+		if err := pe.putArrayLength(len(partitions)); err != nil {
+			return err
+		}
 		for partition, block := range partitions {
 			pe.putInt32(partition)
 
@@ -97,11 +102,11 @@ func (r *AlterPartitionReassignmentsResponse) decode(pd packetDecoder, version i
 
 	r.ErrorCode = KError(kerr)
 
-	if r.ErrorMessage, err = pd.getCompactNullableString(); err != nil {
+	if r.ErrorMessage, err = pd.getNullableString(); err != nil {
 		return err
 	}
 
-	numTopics, err := pd.getCompactArrayLength()
+	numTopics, err := pd.getArrayLength()
 	if err != nil {
 		return err
 	}
@@ -109,12 +114,12 @@ func (r *AlterPartitionReassignmentsResponse) decode(pd packetDecoder, version i
 	if numTopics > 0 {
 		r.Errors = make(map[string]map[int32]*alterPartitionReassignmentsErrorBlock, numTopics)
 		for i := 0; i < numTopics; i++ {
-			topic, err := pd.getCompactString()
+			topic, err := pd.getString()
 			if err != nil {
 				return err
 			}
 
-			ongoingPartitionReassignments, err := pd.getCompactArrayLength()
+			ongoingPartitionReassignments, err := pd.getArrayLength()
 			if err != nil {
 				return err
 			}
@@ -139,11 +144,8 @@ func (r *AlterPartitionReassignmentsResponse) decode(pd packetDecoder, version i
 		}
 	}
 
-	if _, err = pd.getEmptyTaggedFieldArray(); err != nil {
-		return err
-	}
-
-	return nil
+	_, err = pd.getEmptyTaggedFieldArray()
+	return err
 }
 
 func (r *AlterPartitionReassignmentsResponse) key() int16 {
@@ -160,6 +162,14 @@ func (r *AlterPartitionReassignmentsResponse) headerVersion() int16 {
 
 func (r *AlterPartitionReassignmentsResponse) isValidVersion() bool {
 	return r.Version == 0
+}
+
+func (r *AlterPartitionReassignmentsResponse) isFlexible() bool {
+	return r.isFlexibleVersion(r.Version)
+}
+
+func (r *AlterPartitionReassignmentsResponse) isFlexibleVersion(version int16) bool {
+	return version >= 0
 }
 
 func (r *AlterPartitionReassignmentsResponse) requiredVersion() KafkaVersion {
