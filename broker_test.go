@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"reflect"
 	"testing"
@@ -246,6 +247,55 @@ func TestBrokerOpenApiVersionsTransportError(t *testing.T) {
 	if err := broker.Open(conf); errors.Is(err, ErrAlreadyConnected) {
 		t.Fatalf("expected Open retry allowed, got: %v", err)
 	}
+}
+
+func TestBrokerSendInternalSetsResponseVersion(t *testing.T) {
+	t.Parallel()
+
+	client, server := net.Pipe()
+	defer client.Close()
+
+	done := make(chan struct{})
+	go func() {
+		_, _ = io.Copy(io.Discard, server)
+		_ = server.Close()
+		close(done)
+	}()
+
+	broker := NewBroker("127.0.0.1:9092")
+	broker.conn = newBufConn(client)
+	broker.conf = NewTestConfig()
+	broker.conf.Version = V2_4_0_0
+	broker.metricRegistry = metrics.NewRegistry()
+	broker.responses = make(chan *responsePromise, 1)
+	broker.requestRate = metrics.GetOrRegisterMeter("request-rate", broker.metricRegistry)
+	broker.outgoingByteRate = metrics.GetOrRegisterMeter("outgoing-byte-rate", broker.metricRegistry)
+	broker.requestSize = getOrRegisterHistogram("request-size", broker.metricRegistry)
+	broker.requestsInFlight = metrics.GetOrRegisterCounter("requests-in-flight", broker.metricRegistry)
+	broker.protocolRequestsRate = map[int16]metrics.Meter{}
+
+	req := &ElectLeadersRequest{
+		Version:         2,
+		Type:            PreferredElection,
+		TopicPartitions: map[string][]int32{"topic": {0}},
+		TimeoutMs:       1000,
+	}
+	res := new(ElectLeadersResponse)
+	promise := makeResponsePromise(res)
+
+	if err := broker.sendInternal(req, promise); err != nil {
+		t.Fatalf("sendInternal returned error: %v", err)
+	}
+
+	if res.Version != req.Version {
+		t.Fatalf("expected response version %d, got %d", req.Version, res.Version)
+	}
+	if promise.response.headerVersion() != 1 {
+		t.Fatalf("expected flexible response header version 1, got %d", promise.response.headerVersion())
+	}
+
+	_ = client.Close()
+	<-done
 }
 
 func TestBrokerOpenSASLv1FailThenReopenTransportError(t *testing.T) {
