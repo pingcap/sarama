@@ -725,9 +725,9 @@ func (client *client) randomizeSeedBrokers(addrs []string) {
 	}
 }
 
-func (client *client) checkSeedBrokersHealth(brokers []*Broker) []*Broker {
+func (client *client) checkSeedBrokersHealth(brokers []*Broker) {
 	if len(brokers) == 0 {
-		return nil
+		return
 	}
 
 	for _, broker := range brokers {
@@ -736,8 +736,6 @@ func (client *client) checkSeedBrokersHealth(brokers []*Broker) []*Broker {
 			safeAsyncClose(broker)
 		}
 	}
-
-	return brokers
 }
 
 func (client *client) checkBrokersHealth() {
@@ -749,8 +747,8 @@ func (client *client) checkBrokersHealth() {
 		}
 	}
 
-	client.seedBrokers = client.checkSeedBrokersHealth(client.seedBrokers)
-	client.deadSeeds = client.checkSeedBrokersHealth(client.deadSeeds)
+	client.checkSeedBrokersHealth(client.seedBrokers)
+	client.checkSeedBrokersHealth(client.deadSeeds)
 }
 
 func (client *client) updateBroker(brokers []*Broker) {
