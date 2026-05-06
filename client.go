@@ -307,9 +307,6 @@ func (client *client) InitProducerID() (*InitProducerIDResponse, error) {
 
 func (client *client) Close() error {
 	if client.Closed() {
-		// Chances are this is being called from a defer() and the error will go unobserved
-		// so we go ahead and log the event in this case.
-		Logger.Printf("Close() called on already closed client")
 		return ErrClosedClient
 	}
 
