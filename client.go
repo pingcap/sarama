@@ -140,7 +140,7 @@ type client struct {
 	// updateMetadataMs stores the time at which metadata was lasted updated.
 	// Note: this accessed atomically so must be the first word in the struct
 	// as per golang/go#41970
-	updateMetadataMs int64
+	updateMetadataMs atomic.Int64
 
 	conf           *Config
 	closer, closed chan none // for shutting down background metadata updater
@@ -725,6 +725,32 @@ func (client *client) randomizeSeedBrokers(addrs []string) {
 	}
 }
 
+func (client *client) checkSeedBrokersHealth(brokers []*Broker) {
+	if len(brokers) == 0 {
+		return
+	}
+
+	for _, broker := range brokers {
+		if err := broker.getSockError(); err != nil {
+			Logger.Printf("client/seedbrokers close seed broker #%d at %s due to socket error: %v", broker.ID(), broker.Addr(), err)
+			safeAsyncClose(broker)
+		}
+	}
+}
+
+func (client *client) checkBrokersHealth() {
+	for id, broker := range client.brokers {
+		if err := broker.getSockError(); err != nil {
+			Logger.Printf("client/brokers close broker #%d at %s due to socket error: %v", broker.ID(), broker.Addr(), err)
+			safeAsyncClose(broker)
+			delete(client.brokers, id)
+		}
+	}
+
+	client.checkSeedBrokersHealth(client.seedBrokers)
+	client.checkSeedBrokersHealth(client.deadSeeds)
+}
+
 func (client *client) updateBroker(brokers []*Broker) {
 	if client.brokers == nil {
 		return
@@ -1016,7 +1042,7 @@ func (client *client) tryRefreshMetadata(topics []string, attemptsRemaining int,
 				time.Sleep(backoff)
 			}
 
-			t := atomic.LoadInt64(&client.updateMetadataMs)
+			t := client.updateMetadataMs.Load()
 			if time.Since(time.UnixMilli(t)) < backoff {
 				return err
 			}
@@ -1041,7 +1067,7 @@ func (client *client) tryRefreshMetadata(topics []string, attemptsRemaining int,
 
 		req := NewMetadataRequest(client.conf.Version, topics)
 		req.AllowAutoTopicCreation = allowAutoTopicCreation
-		atomic.StoreInt64(&client.updateMetadataMs, time.Now().UnixMilli())
+		client.updateMetadataMs.Store(time.Now().UnixMilli())
 
 		response, err := broker.GetMetadata(req)
 		var kerror KError
@@ -1108,6 +1134,14 @@ func (client *client) updateMetadata(data *MetadataResponse, allKnownMetaData bo
 
 	client.lock.Lock()
 	defer client.lock.Unlock()
+
+	// Check health of existing brokers, including seed brokers, dead
+	// seed brokers, and registered brokers.
+	// - if error occurred on broker's tcp socket, close the tcp
+	//   connection.
+	// - if it's seed broker or dead seed broker, remove it from
+	//   the list.
+	client.checkBrokersHealth()
 
 	// For all the brokers we received:
 	// - if it is a new ID, save it

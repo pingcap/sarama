@@ -30,7 +30,7 @@ type Broker struct {
 	conn          net.Conn
 	connErr       error
 	lock          sync.Mutex
-	opened        int32
+	opened        atomic.Bool
 	responses     chan *responsePromise
 	done          chan bool
 
@@ -157,13 +157,37 @@ func NewBroker(addr string) *Broker {
 	return &Broker{id: -1, addr: addr}
 }
 
+func (b *Broker) getSockError() error {
+	// skip socket health checks while another operation owns broker state
+	if !b.lock.TryLock() {
+		return nil
+	}
+	defer b.lock.Unlock()
+
+	if b.conn == nil {
+		return nil
+	}
+
+	conn := b.conn
+	if c, ok := conn.(*bufConn); ok {
+		conn = c.Conn
+	}
+	if c, ok := conn.(*tls.Conn); ok {
+		conn = c.NetConn()
+	}
+	if c, ok := conn.(*net.TCPConn); ok {
+		return getTCPConnSockError(c)
+	}
+	return nil
+}
+
 // Open tries to connect to the Broker if it is not already connected or connecting, but does not block
 // waiting for the connection to complete. This means that any subsequent operations on the broker will
 // block waiting for the connection to succeed or fail. To get the effect of a fully synchronous Open call,
 // follow it by a call to Connected(). The only errors Open will return directly are ConfigurationError or
 // AlreadyConnected. If conf is nil, the result of NewConfig() is used.
 func (b *Broker) Open(conf *Config) error {
-	if !atomic.CompareAndSwapInt32(&b.opened, 0, 1) {
+	if !b.opened.CompareAndSwap(false, true) {
 		return ErrAlreadyConnected
 	}
 
@@ -190,7 +214,7 @@ func (b *Broker) Open(conf *Config) error {
 		if b.connErr != nil {
 			Logger.Printf("Failed to connect to broker %s: %s\n", b.addr, b.connErr)
 			b.conn = nil
-			atomic.StoreInt32(&b.opened, 0)
+			b.opened.Store(false)
 			return
 		}
 		if conf.Net.TLS.Enable {
@@ -275,7 +299,7 @@ func (b *Broker) Open(conf *Config) error {
 					Logger.Printf("Error while closing connection to broker %s: %s\n", b.addr, err)
 				}
 				b.conn = nil
-				atomic.StoreInt32(&b.opened, 0)
+				b.opened.Store(false)
 				return
 			}
 		}
@@ -287,18 +311,12 @@ func (b *Broker) Open(conf *Config) error {
 		if conf.Net.SASL.Enable && !useSaslV0 {
 			b.connErr = b.authenticateViaSASLv1()
 			if b.connErr != nil {
-				close(b.responses)
-				<-b.done
-				b.responses = nil
-				b.done = nil
-				err = b.conn.Close()
+				err = b.closeLocked()
 				if err == nil {
 					DebugLogger.Printf("Closed connection to broker %s\n", b.addr)
 				} else {
 					Logger.Printf("Error while closing connection to broker %s: %s\n", b.addr, err)
 				}
-				b.conn = nil
-				atomic.StoreInt32(&b.opened, 0)
 				return
 			}
 		}
@@ -377,11 +395,11 @@ func (b *Broker) closeLocked() error {
 	if b.responses != nil {
 		close(b.responses)
 	}
+	// close the socket before waiting so in-flight reads can exit
+	err := b.conn.Close()
 	if b.done != nil {
 		<-b.done
 	}
-
-	err := b.conn.Close()
 
 	b.conn = nil
 	b.responses = nil
@@ -394,8 +412,7 @@ func (b *Broker) closeLocked() error {
 	} else {
 		Logger.Printf("Error while closing connection to broker %s: %s\n", b.addr, err)
 	}
-
-	atomic.StoreInt32(&b.opened, 0)
+	b.opened.Store(false)
 
 	return err
 }
