@@ -1099,9 +1099,14 @@ func (bp *brokerProducer) run() {
 	var output chan<- *produceSet
 
 	for {
-		readyToFlush := bp.timerFired || bp.accumulatingBatch.readyToFlush()
-		if bp.flushingBatch == nil && readyToFlush {
+		var unmuteCh <-chan struct{}
+		if bp.flushingBatch == nil && (bp.timerFired || bp.accumulatingBatch.readyToFlush()) {
 			bp.tryBuildFlushingBatch()
+			if bp.flushingBatch == nil {
+				if ch, blocked := bp.parent.muter.awaitUnmuteChan(bp.accumulatingBatch); blocked {
+					unmuteCh = ch
+				}
+			}
 		}
 
 		var timerChan <-chan time.Time
@@ -1113,13 +1118,6 @@ func (bp *brokerProducer) run() {
 			output = bp.output
 		} else {
 			output = nil
-		}
-
-		var unmuteCh <-chan struct{}
-		if bp.flushingBatch == nil && readyToFlush {
-			if ch, blocked := bp.parent.muter.awaitUnmuteChan(bp.accumulatingBatch); blocked {
-				unmuteCh = ch
-			}
 		}
 
 		select {
