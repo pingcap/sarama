@@ -430,8 +430,8 @@ func TestFuncTxnProduceAndCommitOffset(t *testing.T) {
 
 	handler.started.Add(4)
 	go func() {
-		err = cg.Consume(ctx, []string{"test.4"}, handler)
-		require.NoError(t, err)
+		consumeErr := cg.Consume(ctx, []string{"test.4"}, handler)
+		require.NoError(t, consumeErr)
 	}()
 
 	handler.started.Wait()
