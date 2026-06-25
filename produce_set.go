@@ -12,18 +12,40 @@ type partitionSet struct {
 	bufferBytes   int
 }
 
-// shouldKeepMuted matches retryBatch's whole-batch retry rule: if any message has
-// exhausted retries, the batch will be failed instead of retried.
-func (ps *partitionSet) shouldKeepMuted(maxRetries int) bool {
-	if len(ps.msgs) == 0 {
-		return false
+// markPartitionMuteReusable lets the first message carry the retry batch's
+// right to reuse the partition mute that is still held by its failed send.
+// Only the first message is marked because one held mute represents one
+// in-flight retry permission; marking every message could let split retry
+// fragments bypass each other under the same reservation.
+func (ps *partitionSet) markPartitionMuteReusable() {
+	if len(ps.msgs) > 0 {
+		ps.msgs[0].reusePartitionMute = true
 	}
+}
+
+// canReusePartitionMute reports whether this retry batch may be flushed while
+// its partition is already muted by the previous send attempt.
+func (ps *partitionSet) canReusePartitionMute() bool {
+	return len(ps.msgs) > 0 && ps.msgs[0].reusePartitionMute
+}
+
+// clearPartitionMuteReuse consumes the one-shot reuse marker once the retry
+// batch is selected for flushing.
+func (ps *partitionSet) clearPartitionMuteReuse() {
 	for _, msg := range ps.msgs {
-		if msg.retries >= maxRetries {
-			return false
+		msg.reusePartitionMute = false
+	}
+}
+
+// canRetry prevents holding a partition mute when every message in the set will
+// be returned as an error instead of being retried.
+func (ps *partitionSet) canRetry(maxRetries int) bool {
+	for _, msg := range ps.msgs {
+		if msg.retries < maxRetries {
+			return true
 		}
 	}
-	return true
+	return false
 }
 
 type produceSet struct {
