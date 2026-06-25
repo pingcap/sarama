@@ -26,29 +26,20 @@ func safeAddMessage(t *testing.T, ps *produceSet, msg *ProducerMessage) {
 }
 
 func TestShouldKeepMuted(t *testing.T) {
-	pSet := &partitionSet{}
-	if pSet.shouldKeepMuted(1) {
-		t.Error("empty partition set should not be retryable")
+	if (&partitionSet{}).shouldKeepMuted(1) {
+		t.Fatal("empty partition set should not be retryable")
 	}
-
-	pSet = &partitionSet{
-		msgs: []*ProducerMessage{
-			{retries: 0},
-			{retries: 0},
-		},
+	if !(&partitionSet{msgs: []*ProducerMessage{
+		{retries: 0},
+		{retries: 0},
+	}}).shouldKeepMuted(1) {
+		t.Fatal("expected batch to be retryable when every message is below retry max")
 	}
-	if !pSet.shouldKeepMuted(1) {
-		t.Error("expected batch to be retryable when every message is below retry max")
-	}
-
-	pSet = &partitionSet{
-		msgs: []*ProducerMessage{
-			{retries: 0},
-			{retries: 1},
-		},
-	}
-	if pSet.shouldKeepMuted(1) {
-		t.Error("expected batch not to be retryable when any message has exhausted retries")
+	if (&partitionSet{msgs: []*ProducerMessage{
+		{retries: 0},
+		{retries: 1},
+	}}).shouldKeepMuted(1) {
+		t.Fatal("expected batch not to be retryable when any message has exhausted retries")
 	}
 }
 

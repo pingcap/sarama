@@ -93,15 +93,16 @@ type asyncProducer struct {
 	errors                    chan *ProducerError
 	input, successes, retries chan *ProducerMessage
 	inFlight                  sync.WaitGroup
-
-	// done is closed before waiting on in-flight messages so retryBatch
+	// shutdownCh is closed before waiting on in-flight messages so retryBatch
 	// goroutines can stop waiting on broker handoff and release partition mutes.
-	done   chan struct{}
-	closed atomic.Bool
+	shutdownCh       chan struct{}
+	shutdownChClosed atomic.Bool
 
 	brokers    map[*Broker]*brokerProducer
 	brokerRefs map[*brokerProducer]int
 	brokerLock sync.Mutex
+
+	retryBuffer retryBufferQuota
 
 	txnmgr *transactionManager
 	txLock sync.Mutex
@@ -110,11 +111,15 @@ type asyncProducer struct {
 	// mirroring Kafka's RecordAccumulator.
 	muter *partitionMuter
 
-	// retryBufferQuota tracks producer-level retry buffer occupancy when
-	// Producer.Retry.MaxBufferLength or MaxBufferBytes is bounded.
-	retryBufferQuota messageQuota
-
 	metricsRegistry metrics.Registry
+}
+
+type retryBufferQuota struct {
+	// messages and bytes track producer-level retry buffer occupancy when
+	// Producer.Retry.MaxBufferLength or MaxBufferBytes is bounded.
+	messages int64
+	bytes    int64
+	mu       sync.Mutex
 }
 
 type partitionMuter struct {
@@ -307,19 +312,18 @@ func newAsyncProducer(client Client) (AsyncProducer, error) {
 	}
 
 	p := &asyncProducer{
-		client:           client,
-		conf:             client.Config(),
-		errors:           make(chan *ProducerError),
-		input:            make(chan *ProducerMessage),
-		successes:        make(chan *ProducerMessage),
-		retries:          make(chan *ProducerMessage),
-		done:             make(chan struct{}),
-		brokers:          make(map[*Broker]*brokerProducer),
-		brokerRefs:       make(map[*brokerProducer]int),
-		txnmgr:           txnmgr,
-		muter:            newPartitionMuter(),
-		retryBufferQuota: newRetryBufferQuota(client.Config()),
-		metricsRegistry:  newCleanupRegistry(client.Config().MetricRegistry),
+		client:          client,
+		conf:            client.Config(),
+		errors:          make(chan *ProducerError),
+		input:           make(chan *ProducerMessage),
+		successes:       make(chan *ProducerMessage),
+		retries:         make(chan *ProducerMessage),
+		shutdownCh:      make(chan struct{}),
+		brokers:         make(map[*Broker]*brokerProducer),
+		brokerRefs:      make(map[*brokerProducer]int),
+		txnmgr:          txnmgr,
+		muter:           newPartitionMuter(),
+		metricsRegistry: newCleanupRegistry(client.Config().MetricRegistry),
 	}
 
 	// launch our singleton dispatchers
@@ -793,19 +797,33 @@ func (p *asyncProducer) newPartitionProducer(topic string, partition int32) chan
 }
 
 func (pp *partitionProducer) backoff(retries int) {
-	time.Sleep(pp.parent.calcBackoff(retries))
+	pp.parent.backoff(retries)
 }
 
-func (p *asyncProducer) calcBackoff(retries int) time.Duration {
-	if backoffFunc := p.conf.Producer.Retry.BackoffFunc; backoffFunc != nil {
-		return backoffFunc(retries, p.conf.Producer.Retry.Max)
+func (p *asyncProducer) backoff(retries int) {
+	backoff := p.retryBackoff(retries)
+	if backoff > 0 {
+		time.Sleep(backoff)
 	}
-	return p.conf.Producer.Retry.Backoff
+}
+
+func (p *asyncProducer) retryBackoff(retries int) time.Duration {
+	var backoff time.Duration
+	if p.conf.Producer.Retry.BackoffFunc != nil {
+		maxRetries := p.conf.Producer.Retry.Max
+		backoff = p.conf.Producer.Retry.BackoffFunc(retries, maxRetries)
+	} else {
+		backoff = p.conf.Producer.Retry.Backoff
+	}
+	return backoff
 }
 
 func (p *asyncProducer) shuttingDown() bool {
+	if p.shutdownCh == nil {
+		return false
+	}
 	select {
-	case <-p.done:
+	case <-p.shutdownCh:
 		return true
 	default:
 		return false
@@ -813,16 +831,20 @@ func (p *asyncProducer) shuttingDown() bool {
 }
 
 func (p *asyncProducer) backoffOrDone(retries int) bool {
-	backoff := p.calcBackoff(retries)
+	backoff := p.retryBackoff(retries)
 	if backoff <= 0 {
 		return !p.shuttingDown()
 	}
 	timer := time.NewTimer(backoff)
 	defer timer.Stop()
+	if p.shutdownCh == nil {
+		<-timer.C
+		return true
+	}
 	select {
 	case <-timer.C:
 		return true
-	case <-p.done:
+	case <-p.shutdownCh:
 		return false
 	}
 }
@@ -1108,8 +1130,7 @@ type brokerProducer struct {
 	// output while the batch still owns its partition mute; if the brokerProducer
 	// is shutting down, that send may never be received and the mute would block
 	// later same-partition messages and producer shutdown.
-	done   chan struct{}
-	closed atomic.Bool
+	done chan struct{}
 
 	accumulatingBatch *produceSet
 	flushingBatch     *produceSet // batch that has been muted and is ready to send
@@ -1233,20 +1254,18 @@ func (bp *brokerProducer) tryBuildFlushingBatch() bool {
 	partial := bp.accumulatingBatch.takePartitions(func(topic string, partition int32) bool {
 		return bp.parent.muter.tryMutePartition(topic, partition)
 	})
-	if partial == nil {
-		return false
+	if partial != nil {
+		bp.flushingBatch = partial
+		if bp.accumulatingBatch.empty() {
+			bp.rollOver()
+		}
+		return true
 	}
-	bp.flushingBatch = partial
-	if bp.accumulatingBatch.empty() {
-		bp.rollOver()
-	}
-	return true
+
+	return false
 }
 
 func (bp *brokerProducer) shutdown() {
-	if bp.closed.Swap(true) {
-		return
-	}
 	if bp.done != nil {
 		close(bp.done)
 	}
@@ -1476,20 +1495,25 @@ func (p *asyncProducer) retryBatch(topic string, partition int32, pSet *partitio
 	produceSet := newProduceSet(p)
 	produceSet.addPartitionSet(topic, partition, pSet)
 	bufferMessages, bufferBytes := int64(produceSet.bufferCount), int64(produceSet.bufferBytes)
-	var reservedMessages, reservedBytes int64
-	defer func() {
-		p.retryBufferQuota.release(reservedMessages, reservedBytes)
-	}()
-
+	bufferReserved := false
+	releaseBuffer := func() {
+		if bufferReserved {
+			p.releaseBuffer(bufferMessages, bufferBytes)
+			bufferReserved = false
+		}
+	}
 	muted := alreadyMuted
 	failBatch := func(err error) {
+		releaseBuffer()
 		// Release the partition before reporting errors so a blocked Errors
 		// consumer cannot keep later same-partition messages muted.
 		if muted {
 			p.muter.unmute(produceSet)
 			muted = false
 		}
-		p.returnErrors(pSet.msgs, err)
+		for _, msg := range pSet.msgs {
+			p.returnError(msg, err)
+		}
 	}
 	for _, msg := range pSet.msgs {
 		if msg.retries >= p.conf.Producer.Retry.Max {
@@ -1498,11 +1522,11 @@ func (p *asyncProducer) retryBatch(topic string, partition int32, pSet *partitio
 		}
 		msg.retries++
 	}
-	if !p.retryBufferQuota.tryReserve(bufferMessages, bufferBytes) {
+	if !p.reserveBuffer(bufferMessages, bufferBytes) {
 		failBatch(ErrProducerRetryBufferOverflow)
 		return
 	}
-	reservedMessages, reservedBytes = bufferMessages, bufferBytes
+	bufferReserved = p.retryBufferBounded() && (bufferMessages != 0 || bufferBytes != 0)
 
 	// Honor Producer.Retry.Backoff between retry attempts (#2469). retryBatch
 	// dispatches the produceSet directly to the broker, bypassing partitionProducer.dispatch.
@@ -1527,9 +1551,11 @@ func (p *asyncProducer) retryBatch(topic string, partition int32, pSet *partitio
 	}
 	bp := p.getBrokerProducer(leader)
 	defer p.unrefBrokerProducer(leader, bp)
-	if !p.handoffRetryBatch(bp, produceSet) {
+	if !p.sendRetryBatch(bp, produceSet) {
 		failBatch(ErrShuttingDown)
+		return
 	}
+	releaseBuffer()
 }
 
 type partitionBatchRetry struct {
@@ -1542,7 +1568,9 @@ func (p *asyncProducer) failMutedBatch(batch partitionBatchRetry, err error) {
 	produceSet := newProduceSet(p)
 	produceSet.addPartitionSet(batch.topic, batch.partition, batch.pSet)
 	p.muter.unmute(produceSet)
-	p.returnErrors(batch.pSet.msgs, err)
+	for _, msg := range batch.pSet.msgs {
+		p.returnError(msg, err)
+	}
 }
 
 func (p *asyncProducer) failMutedBatches(batches []partitionBatchRetry, err error) {
@@ -1551,30 +1579,83 @@ func (p *asyncProducer) failMutedBatches(batches []partitionBatchRetry, err erro
 	}
 }
 
-func newRetryBufferQuota(conf *Config) messageQuota {
-	maxBufferLength, maxBufferBytes := retryBufferLimits(conf)
-	return newMessageQuota(maxBufferLength, maxBufferBytes)
-}
-
-func retryBufferLimits(conf *Config) (int64, int64) {
-	maxBufferLength := conf.Producer.Retry.MaxBufferLength
-	if maxBufferLength > 0 {
-		maxBufferLength = max(maxBufferLength, minFunctionalRetryBufferLength)
+func (p *asyncProducer) retryBufferLimits() (int64, int64) {
+	maxBufferLength := p.conf.Producer.Retry.MaxBufferLength
+	if 0 < maxBufferLength && maxBufferLength < minFunctionalRetryBufferLength {
+		maxBufferLength = minFunctionalRetryBufferLength
 	}
 
-	maxBufferBytes := conf.Producer.Retry.MaxBufferBytes
-	if maxBufferBytes > 0 {
-		maxBufferBytes = max(maxBufferBytes, minFunctionalRetryBufferBytes)
+	maxBufferBytes := p.conf.Producer.Retry.MaxBufferBytes
+	if 0 < maxBufferBytes && maxBufferBytes < minFunctionalRetryBufferBytes {
+		maxBufferBytes = minFunctionalRetryBufferBytes
 	}
 
 	return int64(maxBufferLength), maxBufferBytes
 }
 
-func producerMessageByteSizeVersion(conf *Config) int {
-	if conf.Version.IsAtLeast(V0_11_0_0) {
+func (p *asyncProducer) retryBufferBounded() bool {
+	maxBufferLength, maxBufferBytes := p.retryBufferLimits()
+	return maxBufferLength > 0 || maxBufferBytes > 0
+}
+
+func (p *asyncProducer) producerMessageByteSizeVersion() int {
+	if p.conf.Version.IsAtLeast(V0_11_0_0) {
 		return 2
 	}
 	return 1
+}
+
+func (p *asyncProducer) bufferWouldOverflow(messages, bytes int64) bool {
+	maxBufferLength, maxBufferBytes := p.retryBufferLimits()
+	return (maxBufferLength > 0 && messages >= maxBufferLength) ||
+		(maxBufferBytes > 0 && bytes >= maxBufferBytes)
+}
+
+func (p *asyncProducer) reserveBuffer(messages, bytes int64) bool {
+	if messages == 0 && bytes == 0 {
+		return true
+	}
+	if !p.retryBufferBounded() {
+		return true
+	}
+	p.retryBuffer.mu.Lock()
+	defer p.retryBuffer.mu.Unlock()
+
+	if p.bufferWouldOverflow(p.retryBuffer.messages+messages, p.retryBuffer.bytes+bytes) {
+		return false
+	}
+	p.retryBuffer.messages += messages
+	p.retryBuffer.bytes += bytes
+	return true
+}
+
+func (p *asyncProducer) addToBuffer(messages, bytes int64) bool {
+	if messages == 0 && bytes == 0 {
+		return false
+	}
+	if !p.retryBufferBounded() {
+		return false
+	}
+	p.retryBuffer.mu.Lock()
+	defer p.retryBuffer.mu.Unlock()
+
+	p.retryBuffer.messages += messages
+	p.retryBuffer.bytes += bytes
+	return p.bufferWouldOverflow(p.retryBuffer.messages, p.retryBuffer.bytes)
+}
+
+func (p *asyncProducer) releaseBuffer(messages, bytes int64) {
+	if messages == 0 && bytes == 0 {
+		return
+	}
+	if !p.retryBufferBounded() {
+		return
+	}
+	p.retryBuffer.mu.Lock()
+	defer p.retryBuffer.mu.Unlock()
+
+	p.retryBuffer.messages -= messages
+	p.retryBuffer.bytes -= bytes
 }
 
 // retryBatchesAfterRefresh keeps metadata refresh out of brokerProducer.handleError.
@@ -1621,13 +1702,13 @@ func (p *asyncProducer) retryBatchesAfterRefresh(topics []string, batches []part
 		bufferMessages += int64(len(batch.pSet.msgs))
 		bufferBytes += int64(batch.pSet.bufferBytes)
 	}
-	if !p.retryBufferQuota.tryReserve(bufferMessages, bufferBytes) {
+	if !p.reserveBuffer(bufferMessages, bufferBytes) {
 		p.failMutedBatches(retryable, ErrProducerRetryBufferOverflow)
 		return
 	}
 
 	if p.shuttingDown() {
-		p.retryBufferQuota.release(bufferMessages, bufferBytes)
+		p.releaseBuffer(bufferMessages, bufferBytes)
 		p.failMutedBatches(retryable, ErrShuttingDown)
 		return
 	}
@@ -1637,13 +1718,13 @@ func (p *asyncProducer) retryBatchesAfterRefresh(topics []string, batches []part
 		}
 	}
 	if p.shuttingDown() {
-		p.retryBufferQuota.release(bufferMessages, bufferBytes)
+		p.releaseBuffer(bufferMessages, bufferBytes)
 		p.failMutedBatches(retryable, ErrShuttingDown)
 		return
 	}
 
 	if !p.backoffOrDone(maxRetryAttempt) {
-		p.retryBufferQuota.release(bufferMessages, bufferBytes)
+		p.releaseBuffer(bufferMessages, bufferBytes)
 		p.failMutedBatches(retryable, ErrShuttingDown)
 		return
 	}
@@ -1652,15 +1733,15 @@ func (p *asyncProducer) retryBatchesAfterRefresh(topics []string, batches []part
 	for _, batch := range retryable {
 		if p.shuttingDown() {
 			batchMessages, batchBytes := int64(len(batch.pSet.msgs)), int64(batch.pSet.bufferBytes)
-			p.retryBufferQuota.release(batchMessages, batchBytes)
+			p.releaseBuffer(batchMessages, batchBytes)
 			p.failMutedBatch(batch, ErrShuttingDown)
 			continue
 		}
-		leader, err := p.client.Leader(batch.topic, batch.partition)
-		if err != nil {
-			Logger.Printf("Failed retrying batch for %v-%d because of %v while looking up for new leader\n", batch.topic, batch.partition, err)
+		leader, leaderErr := p.client.Leader(batch.topic, batch.partition)
+		if leaderErr != nil {
+			Logger.Printf("Failed retrying batch for %v-%d because of %v while looking up for new leader\n", batch.topic, batch.partition, leaderErr)
 			batchMessages, batchBytes := int64(len(batch.pSet.msgs)), int64(batch.pSet.bufferBytes)
-			p.retryBufferQuota.release(batchMessages, batchBytes)
+			p.releaseBuffer(batchMessages, batchBytes)
 			p.failMutedBatch(batch, retryErr)
 			continue
 		}
@@ -1673,32 +1754,55 @@ func (p *asyncProducer) retryBatchesAfterRefresh(topics []string, batches []part
 	}
 
 	for leader, set := range brokerSets {
-		bp := p.getBrokerProducer(leader)
-		accepted := p.handoffRetryBatch(bp, set)
-		p.unrefBrokerProducer(leader, bp)
-		p.retryBufferQuota.release(int64(set.bufferCount), int64(set.bufferBytes))
-		if !accepted {
-			p.muter.unmute(set)
-			set.eachPartition(func(_ string, _ int32, pSet *partitionSet) {
-				p.returnErrors(pSet.msgs, ErrShuttingDown)
-			})
-		}
+		p.handoffRetrySet(leader, set)
 	}
 }
 
-// handoffRetryBatch transfers ownership of a muted retry batch to the broker
-// bridge. On false, the caller still owns the mute and must fail the batch.
-func (p *asyncProducer) handoffRetryBatch(bp *brokerProducer, set *produceSet) bool {
-	if bp.closed.Load() {
-		return false
+func (p *asyncProducer) handoffRetrySet(leader *Broker, set *produceSet) {
+	bp := p.getBrokerProducer(leader)
+	accepted := p.sendRetryBatch(bp, set)
+	p.unrefBrokerProducer(leader, bp)
+	setMessages, setBytes := int64(set.bufferCount), int64(set.bufferBytes)
+	p.releaseBuffer(setMessages, setBytes)
+	if !accepted {
+		p.muter.unmute(set)
+		set.eachPartition(func(_ string, _ int32, pSet *partitionSet) {
+			for _, msg := range pSet.msgs {
+				p.returnError(msg, ErrShuttingDown)
+			}
+		})
 	}
+}
 
+// sendRetryBatch transfers ownership of a muted retry batch to the broker
+// bridge. A false result means no owner accepted the batch, so the caller must
+// release the mute and fail the messages instead of leaving a retry goroutine
+// blocked while it still owns the partition mute.
+func (p *asyncProducer) sendRetryBatch(bp *brokerProducer, set *produceSet) bool {
+	var done <-chan struct{}
+	if bp.done != nil {
+		done = bp.done
+	}
+	select {
+	case <-done:
+		return false
+	default:
+	}
 	select {
 	case bp.output <- set:
 		return true
-	case <-bp.done:
+	default:
+	}
+	var shutdownCh <-chan struct{}
+	if p.shutdownCh != nil {
+		shutdownCh = p.shutdownCh
+	}
+	select {
+	case bp.output <- set:
+		return true
+	case <-done:
 		return false
-	case <-p.done:
+	case <-shutdownCh:
 		return false
 	}
 }
@@ -1769,7 +1873,7 @@ func (bp *brokerProducer) handleError(sent *produceSet, err error) {
 // effectively a "bridge" between the flushers and the dispatcher in order to avoid deadlock
 // based on https://godoc.org/github.com/eapache/channels#InfiniteChannel
 func (p *asyncProducer) retryHandler() {
-	version := producerMessageByteSizeVersion(p.conf)
+	version := p.producerMessageByteSizeVersion()
 
 	var msg *ProducerMessage
 	buf := queue.New()
@@ -1782,7 +1886,7 @@ func (p *asyncProducer) retryHandler() {
 			case msg = <-p.retries:
 			case p.input <- buf.Peek().(*ProducerMessage):
 				msgToRemove := buf.Remove().(*ProducerMessage)
-				p.retryBufferQuota.release(1, int64(msgToRemove.ByteSize(version)))
+				p.releaseBuffer(1, int64(msgToRemove.ByteSize(version)))
 				continue
 			}
 		}
@@ -1792,7 +1896,7 @@ func (p *asyncProducer) retryHandler() {
 		}
 
 		buf.Add(msg)
-		bufferOverflow := p.retryBufferQuota.addAndCheckOverflow(1, int64(msg.ByteSize(version)))
+		bufferOverflow := p.addToBuffer(1, int64(msg.ByteSize(version)))
 
 		if !bufferOverflow {
 			continue
@@ -1803,10 +1907,10 @@ func (p *asyncProducer) retryHandler() {
 			select {
 			case p.input <- msgToHandle:
 				buf.Remove()
-				p.retryBufferQuota.release(1, int64(msgToHandle.ByteSize(version)))
+				p.releaseBuffer(1, int64(msgToHandle.ByteSize(version)))
 			default:
 				buf.Remove()
-				p.retryBufferQuota.release(1, int64(msgToHandle.ByteSize(version)))
+				p.releaseBuffer(1, int64(msgToHandle.ByteSize(version)))
 				p.returnError(msgToHandle, ErrProducerRetryBufferOverflow)
 			}
 		}
@@ -1817,8 +1921,8 @@ func (p *asyncProducer) retryHandler() {
 
 func (p *asyncProducer) shutdown() {
 	Logger.Println("Producer shutting down.")
-	if p.done != nil && p.closed.CompareAndSwap(false, true) {
-		close(p.done)
+	if p.shutdownCh != nil && p.shutdownChClosed.CompareAndSwap(false, true) {
+		close(p.shutdownCh)
 	}
 	p.inFlight.Add(1)
 	p.input <- &ProducerMessage{flags: shutdown}
@@ -1963,72 +2067,4 @@ func (p *asyncProducer) abandonBrokerConnection(broker *Broker) {
 	}
 
 	delete(p.brokers, broker)
-}
-
-// messageQuota tracks message and byte counts against optional maximums.
-type messageQuota struct {
-	mu          sync.Mutex
-	messages    int64
-	bytes       int64
-	maxMessages int64
-	maxBytes    int64
-}
-
-func newMessageQuota(maxMessages, maxBytes int64) messageQuota {
-	return messageQuota{
-		maxMessages: maxMessages,
-		maxBytes:    maxBytes,
-	}
-}
-
-func (q *messageQuota) tryReserve(messages, bytes int64) bool {
-	if !q.shouldTrack(messages, bytes) {
-		return true
-	}
-
-	q.mu.Lock()
-	defer q.mu.Unlock()
-
-	nextMessages := q.messages + messages
-	nextBytes := q.bytes + bytes
-	if q.wouldOverflow(nextMessages, nextBytes) {
-		return false
-	}
-	q.messages = nextMessages
-	q.bytes = nextBytes
-	return true
-}
-
-func (q *messageQuota) addAndCheckOverflow(messages, bytes int64) bool {
-	if !q.shouldTrack(messages, bytes) {
-		return false
-	}
-
-	q.mu.Lock()
-	defer q.mu.Unlock()
-
-	q.messages += messages
-	q.bytes += bytes
-	return q.wouldOverflow(q.messages, q.bytes)
-}
-
-func (q *messageQuota) release(messages, bytes int64) {
-	if !q.shouldTrack(messages, bytes) {
-		return
-	}
-
-	q.mu.Lock()
-	defer q.mu.Unlock()
-
-	q.messages -= messages
-	q.bytes -= bytes
-}
-
-func (q *messageQuota) shouldTrack(messages, bytes int64) bool {
-	return (messages != 0 || bytes != 0) && (q.maxMessages > 0 || q.maxBytes > 0)
-}
-
-func (q *messageQuota) wouldOverflow(messages, bytes int64) bool {
-	return (q.maxMessages > 0 && messages >= q.maxMessages) ||
-		(q.maxBytes > 0 && bytes >= q.maxBytes)
 }
