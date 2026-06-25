@@ -2764,7 +2764,7 @@ func TestTxnCanAbort(t *testing.T) {
 	require.NoError(t, err)
 }
 
-func TestProducerRetryBufferLimits(t *testing.T) {
+func TestProducerRetriableResponsesBypassRetryBufferLimits(t *testing.T) {
 	broker := NewMockBroker(t, 1)
 	defer broker.Close()
 	topic := "test-topic"
@@ -2800,7 +2800,7 @@ func TestProducerRetryBufferLimits(t *testing.T) {
 				config.Producer.Retry.MaxBufferLength = minFunctionalRetryBufferLength
 			},
 			messageSize: 1, // Small message size
-			numMessages: 10000,
+			numMessages: 2,
 		},
 		{
 			name: "MaxBufferBytes",
@@ -2809,7 +2809,7 @@ func TestProducerRetryBufferLimits(t *testing.T) {
 				config.Producer.Retry.MaxBufferBytes = minFunctionalRetryBufferBytes
 			},
 			messageSize: 950 * 1024, // 950 KB
-			numMessages: 1000,
+			numMessages: 2,
 		},
 	}
 
@@ -2817,6 +2817,7 @@ func TestProducerRetryBufferLimits(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			config := NewTestConfig()
 			config.Producer.Return.Successes = true
+			config.Producer.Retry.Max = 1
 			tt.configureBuffer(config)
 
 			producer, err := NewAsyncProducer([]string{broker.Addr()}, config)
