@@ -2081,6 +2081,37 @@ func TestRetryBatchReleasesMuteOnShutdown(t *testing.T) {
 	parent.muter.unmute(contender)
 }
 
+func TestAbandonBrokerConnectionIgnoresReplacedBrokerProducer(t *testing.T) {
+	parent := &asyncProducer{
+		brokers: make(map[*Broker]*brokerProducer),
+	}
+	broker := &Broker{id: 1}
+	oldBP := &brokerProducer{
+		broker:    broker,
+		abandoned: make(chan struct{}),
+	}
+	newBP := &brokerProducer{
+		broker:    broker,
+		abandoned: make(chan struct{}),
+	}
+	parent.brokers[broker] = newBP
+
+	parent.abandonBrokerConnection(oldBP)
+
+	assertNotDone(t, oldBP.abandoned, 50*time.Millisecond)
+	assertNotDone(t, newBP.abandoned, 50*time.Millisecond)
+	if parent.brokers[broker] != newBP {
+		t.Fatal("old brokerProducer abandoned the replacement")
+	}
+
+	parent.abandonBrokerConnection(newBP)
+
+	assertDoneWithin(t, newBP.abandoned, 2*time.Second)
+	if _, ok := parent.brokers[broker]; ok {
+		t.Fatal("current brokerProducer was not removed")
+	}
+}
+
 type stubLeaderClient struct {
 	cfg    *Config
 	leader *Broker

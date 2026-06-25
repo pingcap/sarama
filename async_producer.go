@@ -1369,7 +1369,7 @@ func (bp *brokerProducer) handleSuccess(sent *produceSet, response *ProduceRespo
 		case ErrInvalidMessage, ErrUnknownTopicOrPartition, ErrLeaderNotAvailable, ErrNotLeaderForPartition,
 			ErrRequestTimedOut, ErrNotEnoughReplicas, ErrNotEnoughReplicasAfterAppend, ErrKafkaStorageError:
 			if bp.parent.conf.Producer.Retry.Max <= 0 {
-				bp.parent.abandonBrokerConnection(bp.broker)
+				bp.parent.abandonBrokerConnection(bp)
 				bp.parent.returnErrors(pSet.msgs, block.Err)
 			} else {
 				retryTopics = append(retryTopics, topic)
@@ -1381,7 +1381,7 @@ func (bp *brokerProducer) handleSuccess(sent *produceSet, response *ProduceRespo
 		// Other non-retriable errors
 		default:
 			if bp.parent.conf.Producer.Retry.Max <= 0 {
-				bp.parent.abandonBrokerConnection(bp.broker)
+				bp.parent.abandonBrokerConnection(bp)
 			}
 			bp.parent.returnErrors(pSet.msgs, block.Err)
 		}
@@ -1417,7 +1417,7 @@ func (bp *brokerProducer) handleSuccess(sent *produceSet, response *ProduceRespo
 					bp.currentRetries[topic][partition] = block.Err
 				}
 				if leaderChanged {
-					bp.parent.abandonBrokerConnection(bp.broker)
+					bp.parent.abandonBrokerConnection(bp)
 				}
 				go bp.parent.retryBatch(topic, partition, pSet, block.Err, true)
 				if bp.parent.conf.Producer.Idempotent {
@@ -1510,7 +1510,7 @@ func (bp *brokerProducer) handleError(sent *produceSet, err error) {
 		bp.parent.muter.unmute(sent)
 	} else {
 		Logger.Printf("producer/broker/%d state change to [closing] because %s\n", bp.broker.ID(), err)
-		bp.parent.abandonBrokerConnection(bp.broker)
+		bp.parent.abandonBrokerConnection(bp)
 		_ = bp.broker.Close()
 		bp.closing = err
 		var retryTopics []string
@@ -1758,14 +1758,15 @@ func (p *asyncProducer) unrefBrokerProducer(broker *Broker, bp *brokerProducer) 
 	}
 }
 
-func (p *asyncProducer) abandonBrokerConnection(broker *Broker) {
+func (p *asyncProducer) abandonBrokerConnection(bp *brokerProducer) {
 	p.brokerLock.Lock()
 	defer p.brokerLock.Unlock()
 
-	bc, ok := p.brokers[broker]
-	if ok && bc.abandoned != nil {
-		close(bc.abandoned)
+	bc, ok := p.brokers[bp.broker]
+	if !ok || bc != bp {
+		return
 	}
 
-	delete(p.brokers, broker)
+	close(bc.abandoned)
+	delete(p.brokers, bp.broker)
 }
