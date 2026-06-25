@@ -300,6 +300,7 @@ func TestAsyncProducerFailureRetry(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		producer.Input() <- &ProducerMessage{Topic: "my_topic", Key: nil, Value: StringEncoder(TestMessage)}
 	}
+	leader2.Returns(metadataLeader2)
 	leader2.Returns(prodSuccess)
 	expectResults(t, producer, 10, 0)
 
@@ -562,6 +563,7 @@ func TestAsyncProducerMultipleRetries(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		producer.Input() <- &ProducerMessage{Topic: "my_topic", Key: nil, Value: StringEncoder(TestMessage)}
 	}
+	leader2.Returns(metadataLeader2)
 	leader2.Returns(prodSuccess)
 	expectResults(t, producer, 10, 0)
 
@@ -620,6 +622,7 @@ func TestAsyncProducerMultipleRetriesWithBackoffFunc(t *testing.T) {
 	expectResults(t, producer, 1, 0)
 
 	producer.Input() <- &ProducerMessage{Topic: "my_topic", Key: nil, Value: StringEncoder(TestMessage)}
+	leader2.Returns(metadataLeader2)
 	leader2.Returns(prodSuccess)
 	expectResults(t, producer, 1, 0)
 
@@ -973,6 +976,7 @@ func TestAsyncProducerFlusherRetryCondition(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		producer.Input() <- &ProducerMessage{Topic: "my_topic", Key: nil, Value: StringEncoder(TestMessage), Partition: 0}
 	}
+	leader.Returns(metadataResponse)
 	prodSuccess = new(ProduceResponse)
 	prodSuccess.AddTopicPartition("my_topic", 0, ErrNoError)
 	leader.Returns(prodSuccess)
@@ -2583,7 +2587,7 @@ func TestRetryBatchesAfterRefreshBrokerDone(t *testing.T) {
 	parent.muter.unmute(contender)
 }
 
-func TestRetryBatchesAfterRefreshShutdown(t *testing.T) {
+func TestRetryBatchesAfterRefreshDrainsDuringProducerShutdown(t *testing.T) {
 	config := NewTestConfig()
 	config.Producer.Idempotent = false
 	config.Producer.Retry.Max = 1
@@ -2630,18 +2634,18 @@ func TestRetryBatchesAfterRefreshShutdown(t *testing.T) {
 
 	parent.retryBatchesAfterRefresh(sent, ErrOutOfBrokers)
 
-	firstErr := assertDoneWithin(t, parent.errors, 2*time.Second)
-	secondErr := assertDoneWithin(t, parent.errors, 2*time.Second)
-	require.Equal(t, ErrShuttingDown, firstErr.Err)
-	require.Equal(t, ErrShuttingDown, secondErr.Err)
-	require.ElementsMatch(t, []int32{0, 1}, []int32{firstErr.Msg.Partition, secondErr.Msg.Partition})
-	assertNotDone(t, output, 50*time.Millisecond)
+	retrySet := assertDoneWithin(t, output, 2*time.Second)
+	require.Contains(t, retrySet.msgs["topic"], int32(0))
+	require.Contains(t, retrySet.msgs["topic"], int32(1))
+	assertNotDone(t, parent.errors, 50*time.Millisecond)
+
+	parent.muter.unmute(retrySet)
 
 	contender := newProduceSet(parent)
 	safeAddMessage(t, contender, &ProducerMessage{Topic: "topic", Partition: 0, Value: StringEncoder("next-0")})
 	safeAddMessage(t, contender, &ProducerMessage{Topic: "topic", Partition: 1, Value: StringEncoder("next-1")})
 	if !parent.muter.tryMute(contender) {
-		t.Fatal("expected partition mutes to be released after shutdown")
+		t.Fatal("expected partition mutes to be released after retried batch completion")
 	}
 	parent.muter.unmute(contender)
 }

@@ -94,8 +94,6 @@ type asyncProducer struct {
 	input, successes, retries chan *ProducerMessage
 	inFlight                  sync.WaitGroup
 
-	// done is closed before waiting on in-flight messages so retry goroutines can
-	// stop waiting on broker handoff and release partition mutes.
 	done   chan struct{}
 	closed atomic.Bool
 
@@ -774,28 +772,6 @@ func (p *asyncProducer) calcBackoff(retries int) time.Duration {
 	return p.conf.Producer.Retry.Backoff
 }
 
-func (p *asyncProducer) shuttingDown() bool {
-	select {
-	case <-p.done:
-		return true
-	default:
-		return false
-	}
-}
-
-func (p *asyncProducer) backoffOrDone(retries int) bool {
-	backoff := p.calcBackoff(retries)
-	if backoff <= 0 {
-		return !p.shuttingDown()
-	}
-	select {
-	case <-time.After(backoff):
-		return true
-	case <-p.done:
-		return false
-	}
-}
-
 func (pp *partitionProducer) updateLeaderIfBrokerProducerIsNil(msg *ProducerMessage) error {
 	if pp.brokerProducer == nil {
 		if err := pp.updateLeader(); err != nil {
@@ -805,23 +781,6 @@ func (pp *partitionProducer) updateLeaderIfBrokerProducerIsNil(msg *ProducerMess
 		}
 	}
 	return nil
-}
-
-func (pp *partitionProducer) tryUpdateLeader(old *Broker) bool {
-	leader, err := pp.parent.client.Leader(pp.topic, pp.partition)
-	if err != nil {
-		return false
-	}
-	if old != nil && leader.ID() == old.ID() {
-		return false
-	}
-
-	pp.leader = leader
-	pp.brokerProducer = pp.parent.getBrokerProducer(pp.leader)
-	pp.parent.inFlight.Add(1)
-	pp.brokerProducer.input <- &ProducerMessage{Topic: pp.topic, Partition: pp.partition, flags: syn}
-	Logger.Printf("producer/leader/%s/%d selected broker %d\n", pp.topic, pp.partition, pp.leader.ID())
-	return true
 }
 
 func (pp *partitionProducer) dispatch() {
@@ -846,12 +805,9 @@ func (pp *partitionProducer) dispatch() {
 			case <-pp.brokerProducer.abandoned:
 				// a message on the abandoned channel means that our current broker selection is out of date
 				Logger.Printf("producer/leader/%s/%d abandoning broker %d\n", pp.topic, pp.partition, pp.leader.ID())
-				oldLeader := pp.leader
 				pp.parent.unrefBrokerProducer(pp.leader, pp.brokerProducer)
 				pp.brokerProducer = nil
-				if !pp.tryUpdateLeader(oldLeader) {
-					time.Sleep(pp.parent.conf.Producer.Retry.Backoff)
-				}
+				time.Sleep(pp.parent.conf.Producer.Retry.Backoff)
 			default:
 				// producer connection is still open.
 			}
@@ -1508,11 +1464,6 @@ func producerMessageByteSizeVersion(conf *Config) int {
 // retryBatchesAfterRefresh retries muted batches from one failed ProduceRequest
 // after a single metadata refresh, preserving that failed-request boundary.
 func (p *asyncProducer) retryBatchesAfterRefresh(batches *produceSet, retryErr error) {
-	if p.shuttingDown() {
-		p.failMutedSet(batches, ErrShuttingDown)
-		return
-	}
-
 	var (
 		maxRetryAttempt             int
 		bufferMessages, bufferBytes int64
@@ -1546,10 +1497,8 @@ func (p *asyncProducer) retryBatchesAfterRefresh(batches *produceSet, retryErr e
 		return
 	}
 
-	if !p.backoffOrDone(maxRetryAttempt) {
-		p.retryBufferQuota.release(bufferMessages, bufferBytes)
-		p.failMutedSet(retryable, ErrShuttingDown)
-		return
+	if backoff := p.calcBackoff(maxRetryAttempt); backoff > 0 {
+		time.Sleep(backoff)
 	}
 	topics := make([]string, 0, len(retryable.msgs))
 	for topic := range retryable.msgs {
@@ -1579,16 +1528,6 @@ func (p *asyncProducer) retryBatchesAfterRefresh(batches *produceSet, retryErr e
 		set.addPartitionSet(topic, partition, pSet)
 	})
 
-	// handoffRetryBatch also checks shutdown, but doing it here avoids creating
-	// or ref-counting brokerProducers just to reject the retry.
-	if p.shuttingDown() {
-		for _, set := range brokerSets {
-			p.retryBufferQuota.release(int64(set.bufferCount), int64(set.bufferBytes))
-			p.failMutedSet(set, ErrShuttingDown)
-		}
-		return
-	}
-
 	for leader, set := range brokerSets {
 		bp := p.getBrokerProducer(leader)
 		accepted := p.handoffRetryBatch(bp, set)
@@ -1603,13 +1542,8 @@ func (p *asyncProducer) retryBatchesAfterRefresh(batches *produceSet, retryErr e
 // handoffRetryBatch transfers ownership of a muted retry batch to the broker
 // bridge. On false, the caller still owns the mute and must fail the batch.
 func (p *asyncProducer) handoffRetryBatch(bp *brokerProducer, set *produceSet) bool {
-	// If shutdown is already visible, do not let select randomly choose a ready
-	// send on bp.output. The second select still handles shutdown racing with
-	// the handoff.
 	select {
 	case <-bp.done:
-		return false
-	case <-p.done:
 		return false
 	default:
 	}
@@ -1617,8 +1551,6 @@ func (p *asyncProducer) handoffRetryBatch(bp *brokerProducer, set *produceSet) b
 	case bp.output <- set:
 		return true
 	case <-bp.done:
-		return false
-	case <-p.done:
 		return false
 	}
 }
