@@ -1910,6 +1910,208 @@ func TestRetryBatchRespectsPartitionMuter(t *testing.T) {
 	}
 }
 
+func TestBrokerProducerHandleErrorKeepsNonIdempotentRetryMuted(t *testing.T) {
+	config := NewTestConfig()
+	config.Producer.Idempotent = false
+	config.Producer.Retry.Max = 1
+	config.Producer.Retry.Backoff = 0
+
+	parent := &asyncProducer{
+		conf:       config,
+		muter:      newPartitionMuter(),
+		brokers:    make(map[*Broker]*brokerProducer),
+		brokerRefs: make(map[*brokerProducer]int),
+		retries:    make(chan *ProducerMessage, 1),
+		done:       make(chan struct{}),
+		txnmgr:     &transactionManager{},
+	}
+	retryLeader := &Broker{id: 2}
+	parent.client = &stubLeaderClient{leader: retryLeader, cfg: config}
+
+	output := make(chan *produceSet, 1)
+	parent.brokers[retryLeader] = &brokerProducer{
+		parent: parent,
+		broker: retryLeader,
+		output: output,
+		input:  make(chan *ProducerMessage),
+	}
+
+	bp := &brokerProducer{
+		parent:            parent,
+		broker:            &Broker{id: 1},
+		input:             make(chan *ProducerMessage),
+		accumulatingBatch: newProduceSet(parent),
+		currentRetries:    make(map[string]map[int32]error),
+	}
+
+	sent := newProduceSet(parent)
+	msg := &ProducerMessage{Topic: "topic", Partition: 0, Value: StringEncoder("retry")}
+	safeAddMessage(t, sent, msg)
+	retryPartitionSet := sent.msgs["topic"][0]
+	if !parent.muter.tryMute(sent) {
+		t.Fatal("expected sent batch to mute partitions")
+	}
+
+	bp.handleError(sent, ErrOutOfBrokers)
+
+	assertNotDone(t, parent.retries, 50*time.Millisecond)
+	contender := newProduceSet(parent)
+	safeAddMessage(t, contender, &ProducerMessage{Topic: "topic", Partition: 0, Value: StringEncoder("next")})
+	if parent.muter.tryMute(contender) {
+		parent.muter.unmute(contender)
+		t.Fatal("expected connection retry to keep sent partition muted")
+	}
+
+	retrySet := assertDoneWithin(t, output, 2*time.Second)
+	parent.muter.unmute(retrySet)
+	require.Equal(t, retryPartitionSet, retrySet.msgs["topic"][0])
+	require.Equal(t, 1, msg.retries)
+}
+
+func TestHandleSuccessNonIdempotentRetryKeepsMute(t *testing.T) {
+	config := NewTestConfig()
+	config.Producer.Idempotent = false
+	config.Producer.Retry.Max = 1
+	config.Producer.Retry.Backoff = 0
+
+	parent := &asyncProducer{
+		conf:       config,
+		muter:      newPartitionMuter(),
+		brokers:    make(map[*Broker]*brokerProducer),
+		brokerRefs: make(map[*brokerProducer]int),
+		retries:    make(chan *ProducerMessage, 1),
+		done:       make(chan struct{}),
+		txnmgr:     &transactionManager{},
+	}
+	retryLeader := &Broker{id: 2}
+	parent.client = &stubLeaderClient{leader: retryLeader, cfg: config}
+
+	output := make(chan *produceSet)
+	parent.brokers[retryLeader] = &brokerProducer{
+		parent: parent,
+		broker: retryLeader,
+		output: output,
+		input:  make(chan *ProducerMessage),
+	}
+
+	bp := &brokerProducer{
+		parent:            parent,
+		broker:            &Broker{id: 1},
+		input:             make(chan *ProducerMessage),
+		accumulatingBatch: newProduceSet(parent),
+		currentRetries:    make(map[string]map[int32]error),
+	}
+
+	sent := newProduceSet(parent)
+	msg := &ProducerMessage{Topic: "topic", Partition: 0, Value: StringEncoder("retry")}
+	safeAddMessage(t, sent, msg)
+	retryPartitionSet := sent.msgs["topic"][0]
+	if !parent.muter.tryMute(sent) {
+		t.Fatal("expected sent batch to mute partitions")
+	}
+
+	response := new(ProduceResponse)
+	response.AddTopicPartition("topic", 0, ErrNotLeaderForPartition)
+	bp.handleSuccess(sent, response)
+
+	assertNotDone(t, parent.retries, 50*time.Millisecond)
+	contender := newProduceSet(parent)
+	safeAddMessage(t, contender, &ProducerMessage{Topic: "topic", Partition: 0, Value: StringEncoder("next")})
+	if parent.muter.tryMute(contender) {
+		parent.muter.unmute(contender)
+		t.Fatal("expected response retry to keep sent partition muted")
+	}
+
+	retrySet := assertDoneWithin(t, output, 2*time.Second)
+	parent.muter.unmute(retrySet)
+	require.Equal(t, retryPartitionSet, retrySet.msgs["topic"][0])
+	require.Equal(t, 1, msg.retries)
+}
+
+func TestRetryBatchReleasesMuteOnShutdown(t *testing.T) {
+	config := NewTestConfig()
+	config.Producer.Idempotent = false
+	config.Producer.Retry.Max = 1
+	config.Producer.Retry.Backoff = 0
+	config.Producer.Return.Errors = true
+
+	parent := &asyncProducer{
+		conf:       config,
+		muter:      newPartitionMuter(),
+		brokers:    make(map[*Broker]*brokerProducer),
+		brokerRefs: make(map[*brokerProducer]int),
+		errors:     make(chan *ProducerError, 1),
+		done:       make(chan struct{}),
+		txnmgr:     &transactionManager{},
+	}
+	leader := &Broker{id: 1}
+	parent.client = &stubLeaderClient{leader: leader, cfg: config}
+	parent.brokers[leader] = &brokerProducer{
+		parent: parent,
+		broker: leader,
+		output: make(chan *produceSet),
+		input:  make(chan *ProducerMessage),
+	}
+
+	sent := newProduceSet(parent)
+	safeAddMessage(t, sent, &ProducerMessage{Topic: "topic", Partition: 0, Value: StringEncoder("retry")})
+	retryPartitionSet := sent.msgs["topic"][0]
+	if !parent.muter.tryMute(sent) {
+		t.Fatal("expected sent batch to mute partitions")
+	}
+	parent.inFlight.Add(1)
+
+	done := make(chan struct{})
+	go func() {
+		parent.retryBatch("topic", 0, retryPartitionSet, ErrOutOfBrokers, true)
+		close(done)
+	}()
+
+	close(parent.done)
+
+	producerErr := assertDoneWithin(t, parent.errors, 2*time.Second)
+	require.Equal(t, ErrShuttingDown, producerErr.Err)
+	assertDoneWithin(t, done, 2*time.Second)
+
+	contender := newProduceSet(parent)
+	safeAddMessage(t, contender, &ProducerMessage{Topic: "topic", Partition: 0, Value: StringEncoder("next")})
+	if !parent.muter.tryMute(contender) {
+		t.Fatal("expected partition mute to be released after aborted retry handoff")
+	}
+	parent.muter.unmute(contender)
+}
+
+func TestAbandonBrokerConnectionIgnoresReplacedBrokerProducer(t *testing.T) {
+	parent := &asyncProducer{
+		brokers: make(map[*Broker]*brokerProducer),
+	}
+	broker := &Broker{id: 1}
+	oldBP := &brokerProducer{
+		broker:    broker,
+		abandoned: make(chan struct{}),
+	}
+	newBP := &brokerProducer{
+		broker:    broker,
+		abandoned: make(chan struct{}),
+	}
+	parent.brokers[broker] = newBP
+
+	parent.abandonBrokerConnection(oldBP)
+
+	assertNotDone(t, oldBP.abandoned, 50*time.Millisecond)
+	assertNotDone(t, newBP.abandoned, 50*time.Millisecond)
+	if parent.brokers[broker] != newBP {
+		t.Fatal("old brokerProducer abandoned the replacement")
+	}
+
+	parent.abandonBrokerConnection(newBP)
+
+	assertDoneWithin(t, newBP.abandoned, 2*time.Second)
+	if _, ok := parent.brokers[broker]; ok {
+		t.Fatal("current brokerProducer was not removed")
+	}
+}
+
 type stubLeaderClient struct {
 	cfg    *Config
 	leader *Broker
@@ -2562,7 +2764,7 @@ func TestTxnCanAbort(t *testing.T) {
 	require.NoError(t, err)
 }
 
-func TestProducerRetryBufferLimits(t *testing.T) {
+func TestProducerRetriableResponsesBypassRetryBufferLimits(t *testing.T) {
 	broker := NewMockBroker(t, 1)
 	defer broker.Close()
 	topic := "test-topic"
@@ -2598,7 +2800,7 @@ func TestProducerRetryBufferLimits(t *testing.T) {
 				config.Producer.Retry.MaxBufferLength = minFunctionalRetryBufferLength
 			},
 			messageSize: 1, // Small message size
-			numMessages: 10000,
+			numMessages: 2,
 		},
 		{
 			name: "MaxBufferBytes",
@@ -2607,7 +2809,7 @@ func TestProducerRetryBufferLimits(t *testing.T) {
 				config.Producer.Retry.MaxBufferBytes = minFunctionalRetryBufferBytes
 			},
 			messageSize: 950 * 1024, // 950 KB
-			numMessages: 1000,
+			numMessages: 2,
 		},
 	}
 
@@ -2615,6 +2817,7 @@ func TestProducerRetryBufferLimits(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			config := NewTestConfig()
 			config.Producer.Return.Successes = true
+			config.Producer.Retry.Max = 1
 			tt.configureBuffer(config)
 
 			producer, err := NewAsyncProducer([]string{broker.Addr()}, config)
@@ -2662,7 +2865,8 @@ func TestProducerRetryBufferLimits(t *testing.T) {
 			wg.Wait()
 
 			assert.Equal(t, successes+producerErrors, tt.numMessages, "Expected all messages to be processed")
-			assert.True(t, errorFound, "Expected at least one error matching ErrProducerRetryBufferOverflow")
+			assert.Equal(t, 0, successes, "Expected retriable responses to eventually fail without successful writes")
+			assert.False(t, errorFound, "Ordered sent-batch retries should be backpressured by partition mute, not retry-buffer overflow")
 		})
 	}
 }

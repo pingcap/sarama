@@ -253,7 +253,7 @@ func (b *Broker) Open(conf *Config) error {
 					return
 				}
 
-				Logger.Printf("Error while sending ApiVersionsRequest V3 to broker %s: %s\n", b.addr, err)
+				DebugLogger.Printf("Error while sending ApiVersionsRequest V3 to broker %s: %s\n", b.addr, err)
 				// send a lower version request in case remote cluster is <= 2.4.0.0
 				maxVersion := int16(0)
 				if apiVersionsResponse != nil {
@@ -269,7 +269,7 @@ func (b *Broker) Open(conf *Config) error {
 					if b.maybeCloseLocked(err) {
 						return
 					}
-					Logger.Printf("Error while sending ApiVersionsRequest V%d to broker %s: %s\n", maxVersion, b.addr, err)
+					DebugLogger.Printf("Error while sending ApiVersionsRequest V%d to broker %s: %s\n", maxVersion, b.addr, err)
 				}
 			}
 			if apiVersionsResponse != nil {
