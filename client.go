@@ -732,7 +732,7 @@ func (client *client) checkSeedBrokersHealth(brokers []*Broker) {
 
 	for _, broker := range brokers {
 		if err := broker.getSockError(); err != nil {
-			DebugLogger.Printf("client/seedbrokers close seed broker #%d at %s due to socket error: %v", broker.ID(), broker.Addr(), err)
+			Logger.Printf("client/seedbrokers close seed broker #%d at %s due to socket error: %v", broker.ID(), broker.Addr(), err)
 			safeAsyncClose(broker)
 		}
 	}
@@ -741,7 +741,7 @@ func (client *client) checkSeedBrokersHealth(brokers []*Broker) {
 func (client *client) checkBrokersHealth() {
 	for id, broker := range client.brokers {
 		if err := broker.getSockError(); err != nil {
-			DebugLogger.Printf("client/brokers close broker #%d at %s due to socket error: %v", broker.ID(), broker.Addr(), err)
+			Logger.Printf("client/brokers close broker #%d at %s due to socket error: %v", broker.ID(), broker.Addr(), err)
 			safeAsyncClose(broker)
 			delete(client.brokers, id)
 		}
