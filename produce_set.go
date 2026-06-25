@@ -12,20 +12,6 @@ type partitionSet struct {
 	bufferBytes   int
 }
 
-// shouldKeepMuted matches retryBatch's whole-batch retry rule: if any message has
-// exhausted retries, the batch will be failed instead of retried.
-func (ps *partitionSet) shouldKeepMuted(maxRetries int) bool {
-	if len(ps.msgs) == 0 {
-		return false
-	}
-	for _, msg := range ps.msgs {
-		if msg.retries >= maxRetries {
-			return false
-		}
-	}
-	return true
-}
-
 type produceSet struct {
 	parent        *asyncProducer
 	msgs          map[string]map[int32]*partitionSet
@@ -48,15 +34,6 @@ func newProduceSetWithMeta(parent *asyncProducer, producerID int64, producerEpoc
 		producerID:    producerID,
 		producerEpoch: producerEpoch,
 	}
-}
-
-func (ps *produceSet) addPartitionSet(topic string, partition int32, set *partitionSet) {
-	if ps.msgs[topic] == nil {
-		ps.msgs[topic] = make(map[int32]*partitionSet)
-	}
-	ps.msgs[topic][partition] = set
-	ps.bufferBytes += set.bufferBytes
-	ps.bufferCount += len(set.msgs)
 }
 
 func (ps *produceSet) add(msg *ProducerMessage) error {
