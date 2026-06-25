@@ -1039,10 +1039,9 @@ func validateProducerMetrics(t *testing.T, client Client) {
 		}
 		metricValidators.registerForGlobalAndTopic("test_1", maxValHistogramValidator("compression-ratio", 1000))
 	} else {
-		// We record compression ratios of 1.00 (100 with a histogram) for every TestBatchSize record
+		// We record compression ratios of 1.00 (100 with a histogram) for each record batch.
 		if client.Config().Version.IsAtLeast(V0_11_0_0) {
-			// records will be grouped in batchSet rather than msgSet
-			metricValidators.registerForGlobalAndTopic("test_1", minCountHistogramValidator("compression-ratio", 3))
+			metricValidators.registerForGlobalAndTopic("test_1", minCountHistogramValidator("compression-ratio", 1))
 		} else {
 			metricValidators.registerForGlobalAndTopic("test_1", countHistogramValidator("compression-ratio", TestBatchSize))
 		}
