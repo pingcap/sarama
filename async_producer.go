@@ -1206,6 +1206,7 @@ func (bp *brokerProducer) run() {
 			}
 
 			if bp.accumulatingBatch.wouldOverflow(msg) {
+				DebugLogger.Printf("producer/broker/%d maximum request accumulated, waiting for space\n", bp.broker.ID())
 				if err := bp.waitForSpace(msg, false); err != nil {
 					bp.parent.retryMessage(msg, err)
 					continue
