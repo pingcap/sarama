@@ -1109,9 +1109,10 @@ func (bp *brokerProducer) run() {
 			}
 
 			if reason := bp.needsRetry(msg); reason != nil {
+				flags := msg.flags
 				bp.parent.retryMessage(msg, reason)
 
-				if bp.closing == nil && msg.flags&fin == fin {
+				if bp.closing == nil && flags&fin == fin {
 					// we were retrying this partition but we can start processing again
 					delete(bp.currentRetries[msg.Topic], msg.Partition)
 				}
@@ -1207,12 +1208,15 @@ func (bp *brokerProducer) shutdown() {
 		if bp.flushingBatch == nil {
 			bp.tryBuildFlushingBatch()
 		}
-		var unmuteCh <-chan struct{}
 		var outputCh chan<- *produceSet
 		if bp.flushingBatch != nil {
 			outputCh = bp.output
-		} else if ch, blocked := bp.parent.muter.awaitUnmuteChan(bp.accumulatingBatch); blocked {
-			unmuteCh = ch
+		} else if _, blocked := bp.parent.muter.awaitUnmuteChan(bp.accumulatingBatch); blocked {
+			bp.accumulatingBatch.eachPartition(func(_ string, _ int32, pSet *partitionSet) {
+				bp.parent.returnErrors(pSet.msgs, ErrShuttingDown)
+			})
+			bp.rollOver()
+			continue
 		}
 		select {
 		case response, ok := <-bp.responses:
@@ -1221,7 +1225,6 @@ func (bp *brokerProducer) shutdown() {
 			}
 		case outputCh <- bp.flushingBatch:
 			bp.flushingBatch = nil
-		case <-unmuteCh:
 		}
 	}
 	close(bp.output)
