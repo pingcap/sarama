@@ -184,13 +184,6 @@ func (m *partitionMuter) tryMutePartition(topic string, partition int32) bool {
 	return true
 }
 
-func (m *partitionMuter) isMutedPartition(topic string, partition int32) bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	return m.isMuted(topic, partition)
-}
-
 // waitUntilMuted blocks until all partitions in the set can be muted, then mutes them.
 // Returns false if the muter was closed before all partitions could be muted.
 func (m *partitionMuter) waitUntilMuted(set *produceSet) bool {
@@ -383,11 +376,6 @@ type ProducerMessage struct {
 	sequenceNumber int32
 	producerEpoch  int16
 	hasSequence    bool
-	// reusePartitionMute is a one-shot marker for non-idempotent retries. The
-	// first retried message from a failed, still-muted batch may reuse that
-	// existing in-flight reservation so later same-partition messages cannot
-	// slip in between the failed send and its retry.
-	reusePartitionMute bool
 }
 
 const producerMessageOverhead = 26 // the metadata overhead of CRC, flags, etc.
@@ -414,7 +402,6 @@ func (m *ProducerMessage) ByteSize(version int) int {
 func (m *ProducerMessage) clear() {
 	m.flags = 0
 	m.retries = 0
-	m.reusePartitionMute = false
 	m.sequenceNumber = 0
 	m.producerEpoch = 0
 	m.hasSequence = false
@@ -1096,14 +1083,8 @@ func (bp *brokerProducer) run() {
 	var output chan<- *produceSet
 
 	for {
-		var unmuteCh <-chan struct{}
 		if bp.flushingBatch == nil && (bp.timerFired || bp.accumulatingBatch.readyToFlush()) {
 			bp.tryBuildFlushingBatch()
-			if bp.flushingBatch == nil {
-				if ch, blocked := bp.parent.muter.awaitUnmuteChan(bp.accumulatingBatch); blocked {
-					unmuteCh = ch
-				}
-			}
 		}
 
 		var timerChan <-chan time.Time
@@ -1188,7 +1169,6 @@ func (bp *brokerProducer) run() {
 			if ok {
 				bp.handleResponse(response)
 			}
-		case <-unmuteCh:
 		}
 	}
 }
@@ -1206,29 +1186,10 @@ func (bp *brokerProducer) tryBuildFlushingBatch() bool {
 	partial := bp.accumulatingBatch.takePartitions(func(topic string, partition int32) bool {
 		return bp.parent.muter.tryMutePartition(topic, partition)
 	})
-	if partial != nil {
-		bp.flushingBatch = partial
-		if bp.accumulatingBatch.empty() {
-			bp.rollOver()
-		}
-		return true
-	}
-
-	reused := bp.accumulatingBatch.takePartitions(func(topic string, partition int32) bool {
-		partitions := bp.accumulatingBatch.msgs[topic]
-		if partitions == nil {
-			return false
-		}
-		set := partitions[partition]
-		return set.canReusePartitionMute() && bp.parent.muter.isMutedPartition(topic, partition)
-	})
-	if reused == nil {
+	if partial == nil {
 		return false
 	}
-	reused.eachPartition(func(_ string, _ int32, pSet *partitionSet) {
-		pSet.clearPartitionMuteReuse()
-	})
-	bp.flushingBatch = reused
+	bp.flushingBatch = partial
 	if bp.accumulatingBatch.empty() {
 		bp.rollOver()
 	}
@@ -1393,7 +1354,7 @@ func (bp *brokerProducer) handleSuccess(sent *produceSet, response *ProduceRespo
 				bp.parent.returnErrors(pSet.msgs, block.Err)
 			} else {
 				retryTopics = append(retryTopics, topic)
-				if bp.parent.conf.Producer.Idempotent || pSet.canRetry(bp.parent.conf.Producer.Retry.Max) {
+				if bp.parent.conf.Producer.Idempotent {
 					if keepMuted[topic] == nil {
 						keepMuted[topic] = make(map[int32]struct{})
 					}
@@ -1436,7 +1397,6 @@ func (bp *brokerProducer) handleSuccess(sent *produceSet, response *ProduceRespo
 				if bp.parent.conf.Producer.Idempotent {
 					go bp.parent.retryBatch(topic, partition, pSet, block.Err, true)
 				} else {
-					pSet.markPartitionMuteReusable()
 					bp.parent.retryMessages(pSet.msgs, block.Err)
 				}
 				// dropping the following messages has the side effect of incrementing their retry count
@@ -1532,16 +1492,13 @@ func (bp *brokerProducer) handleError(sent *produceSet, err error) {
 				bp.currentRetries[topic] = make(map[int32]error)
 			}
 			bp.currentRetries[topic][partition] = err
-			if bp.parent.conf.Producer.Idempotent || pSet.canRetry(bp.parent.conf.Producer.Retry.Max) {
+			if bp.parent.conf.Producer.Idempotent {
 				if keepMuted[topic] == nil {
 					keepMuted[topic] = make(map[int32]struct{})
 				}
 				keepMuted[topic][partition] = struct{}{}
-			}
-			if bp.parent.conf.Producer.Idempotent {
 				go bp.parent.retryBatch(topic, partition, pSet, err, true)
 			} else {
-				pSet.markPartitionMuteReusable()
 				bp.parent.retryMessages(pSet.msgs, err)
 			}
 		})
