@@ -286,10 +286,9 @@ func TestSyncProducerToNonExistingTopic(t *testing.T) {
 	broker.Close()
 }
 
-func TestSyncProducerRecoveryWithRetriesDisabled(t *testing.T) {
+func TestSyncProducerTerminalFailurePoisonsProducerWithRetriesDisabled(t *testing.T) {
 	seedBroker := NewMockBroker(t, 1)
 	leader1 := NewMockBroker(t, 2)
-	leader2 := NewMockBroker(t, 3)
 
 	metadataLeader1 := new(MetadataResponse)
 	metadataLeader1.AddBroker(leader1.Addr(), leader1.BrokerID())
@@ -314,20 +313,12 @@ func TestSyncProducerRecoveryWithRetriesDisabled(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	metadataLeader2 := new(MetadataResponse)
-	metadataLeader2.AddBroker(leader2.Addr(), leader2.BrokerID())
-	metadataLeader2.AddTopicPartition("my_topic", 0, leader2.BrokerID(), nil, nil, nil, ErrNoError)
-	leader1.Returns(metadataLeader2)
-	prodSuccess := new(ProduceResponse)
-	prodSuccess.AddTopicPartition("my_topic", 0, ErrNoError)
-	leader2.Returns(prodSuccess)
 	_, _, err = producer.SendMessage(&ProducerMessage{Topic: "my_topic", Value: StringEncoder(TestMessage)})
-	if err != nil {
+	if !errors.Is(err, ErrShuttingDown) {
 		t.Fatal(err)
 	}
 
 	leader1.Close()
-	leader2.Close()
 	safeClose(t, producer)
 }
 

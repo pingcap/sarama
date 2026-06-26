@@ -108,12 +108,16 @@ type asyncProducer struct {
 	// mirroring Kafka's RecordAccumulator.
 	muter *partitionMuter
 
+	// poisoned stops all future sends after an ordered sent batch has failed
+	// definitively. This prevents later messages from reaching Kafka before an
+	// upstream replay of the failed batch.
+	poisoned atomic.Bool
+
 	metricsRegistry metrics.Registry
 }
 
 type partitionMuter struct {
 	mu             sync.Mutex
-	cond           *sync.Cond
 	closed         bool
 	inFlightCounts map[string]map[int32]int // topic -> partition -> in-flight count
 	unmuteSignal   chan struct{}
@@ -124,7 +128,6 @@ func newPartitionMuter() *partitionMuter {
 		inFlightCounts: make(map[string]map[int32]int),
 		unmuteSignal:   make(chan struct{}),
 	}
-	m.cond = sync.NewCond(&m.mu)
 	return m
 }
 
@@ -188,30 +191,6 @@ func (m *partitionMuter) tryMutePartition(topic string, partition int32) bool {
 	return true
 }
 
-// waitUntilMuted blocks until all partitions in the set can be muted, then mutes them.
-// Returns false if the muter was closed before all partitions could be muted.
-func (m *partitionMuter) waitUntilMuted(set *produceSet) bool {
-	if set == nil || set.empty() {
-		return false
-	}
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	for {
-		if m.closed {
-			return false
-		}
-		if !m.isAnyMuted(set) {
-			break
-		}
-		m.cond.Wait()
-	}
-
-	m.muteSet(set)
-	return true
-}
-
 func (m *partitionMuter) awaitUnmuteChan(set *produceSet) (<-chan struct{}, bool) {
 	if set == nil || set.empty() {
 		return nil, false
@@ -255,10 +234,9 @@ func (m *partitionMuter) unmute(set *produceSet) {
 	})
 	close(m.unmuteSignal)
 	m.unmuteSignal = make(chan struct{})
-	m.cond.Broadcast()
 }
 
-// close shuts down the muter, waking any goroutines blocked in waitUntilMuted.
+// close shuts down the muter, waking any goroutines waiting for partitions to unmute.
 func (m *partitionMuter) close() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -268,7 +246,6 @@ func (m *partitionMuter) close() {
 	}
 	m.closed = true
 	close(m.unmuteSignal)
-	m.cond.Broadcast()
 }
 
 // NewAsyncProducer creates a new AsyncProducer using the given broker addresses and configuration.
@@ -600,6 +577,11 @@ func (p *asyncProducer) dispatcher() {
 			continue
 		}
 
+		if p.poisoned.Load() && msg.flags&fin == fin {
+			p.inFlight.Done()
+			continue
+		}
+
 		if msg.retries == 0 {
 			if shuttingDown {
 				// we can't just call returnError here because that decrements the wait group,
@@ -613,6 +595,10 @@ func (p *asyncProducer) dispatcher() {
 				continue
 			}
 			p.inFlight.Add(1)
+			if p.poisoned.Load() {
+				p.returnError(msg, ErrShuttingDown)
+				continue
+			}
 			// Ignore retried msg, there are already in txn.
 			// Can't produce new record when transaction is not started.
 			if p.IsTransactional() && p.txnmgr.currentTxnStatus()&ProducerTxnFlagInTransaction == 0 {
@@ -620,6 +606,9 @@ func (p *asyncProducer) dispatcher() {
 				p.returnError(msg, ErrTransactionNotReady)
 				continue
 			}
+		} else if p.poisoned.Load() {
+			p.returnError(msg, ErrShuttingDown)
+			continue
 		}
 
 		for _, interceptor := range p.conf.Producer.Interceptors {
@@ -682,6 +671,14 @@ func (p *asyncProducer) newTopicProducer(topic string) chan<- *ProducerMessage {
 
 func (tp *topicProducer) dispatch() {
 	for msg := range tp.input {
+		if tp.parent.poisoned.Load() {
+			if msg.flags&fin == fin {
+				tp.parent.inFlight.Done()
+			} else {
+				tp.parent.returnError(msg, ErrShuttingDown)
+			}
+			continue
+		}
 		if msg.retries == 0 {
 			if err := tp.partitionMessage(msg); err != nil {
 				tp.parent.returnError(msg, err)
@@ -805,6 +802,11 @@ func (p *asyncProducer) retryBackoff(retries int) {
 func (pp *partitionProducer) updateLeaderIfBrokerProducerIsNil(msg *ProducerMessage) error {
 	if pp.brokerProducer == nil {
 		if err := pp.updateLeader(); err != nil {
+			if !pp.parent.conf.Producer.Idempotent {
+				if pp.parent.poisoned.CompareAndSwap(false, true) {
+					Logger.Printf("producer state change to [poisoned] on %s/%d because leader update failed: %v\n", pp.topic, pp.partition, err)
+				}
+			}
 			pp.parent.returnError(msg, err)
 			pp.backoff(msg.retries)
 			return err
@@ -830,6 +832,15 @@ func (pp *partitionProducer) dispatch() {
 	}()
 
 	for msg := range pp.input {
+		if pp.parent.poisoned.Load() {
+			if msg.flags&fin == fin {
+				pp.parent.inFlight.Done()
+			} else {
+				pp.parent.returnError(msg, ErrShuttingDown)
+			}
+			continue
+		}
+
 		if pp.brokerProducer != nil {
 			select {
 			case <-pp.brokerProducer.abandoned:
@@ -920,6 +931,11 @@ func (pp *partitionProducer) flushRetryBuffers() {
 
 		if pp.brokerProducer == nil {
 			if err := pp.updateLeader(); err != nil {
+				if !pp.parent.conf.Producer.Idempotent && len(pp.retryState[pp.highWatermark].buf) > 0 {
+					if pp.parent.poisoned.CompareAndSwap(false, true) {
+						Logger.Printf("producer state change to [poisoned] on %s/%d because retry buffer leader update failed: %v\n", pp.topic, pp.partition, err)
+					}
+				}
 				pp.parent.returnErrors(pp.retryState[pp.highWatermark].buf, err)
 				goto flushDone
 			}
@@ -1096,6 +1112,10 @@ func (bp *brokerProducer) run() {
 	var output chan<- *produceSet
 
 	for {
+		if bp.abortBatchesIfPoisoned() {
+			continue
+		}
+
 		if bp.flushingBatch == nil && (bp.timerFired || bp.accumulatingBatch.readyToFlush()) {
 			bp.tryBuildFlushingBatch()
 		}
@@ -1134,6 +1154,15 @@ func (bp *brokerProducer) run() {
 				}
 				bp.currentRetries[msg.Topic][msg.Partition] = nil
 				bp.parent.inFlight.Done()
+				continue
+			}
+
+			if bp.parent.poisoned.Load() {
+				if msg.flags&fin == fin {
+					bp.parent.inFlight.Done()
+				} else {
+					bp.parent.returnError(msg, ErrShuttingDown)
+				}
 				continue
 			}
 
@@ -1196,6 +1225,9 @@ func (bp *brokerProducer) tryBuildFlushingBatch() bool {
 	if bp.flushingBatch != nil || bp.accumulatingBatch.empty() {
 		return false
 	}
+	if bp.parent.poisoned.Load() {
+		return false
+	}
 	if bp.parent.muter.tryMute(bp.accumulatingBatch) {
 		bp.flushingBatch = bp.accumulatingBatch
 		bp.rollOver()
@@ -1215,9 +1247,32 @@ func (bp *brokerProducer) tryBuildFlushingBatch() bool {
 	return true
 }
 
+func (bp *brokerProducer) abortBatchesIfPoisoned() bool {
+	if !bp.parent.poisoned.Load() {
+		return false
+	}
+
+	aborted := false
+	if bp.flushingBatch != nil {
+		bp.parent.returnProduceSetErrors(bp.flushingBatch, ErrShuttingDown)
+		bp.parent.muter.unmute(bp.flushingBatch)
+		bp.flushingBatch = nil
+		aborted = true
+	}
+	if !bp.accumulatingBatch.empty() {
+		bp.parent.returnProduceSetErrors(bp.accumulatingBatch, ErrShuttingDown)
+		bp.rollOver()
+		aborted = true
+	}
+	return aborted
+}
+
 func (bp *brokerProducer) shutdown() {
 	// flush any ready buffer
 	for bp.flushingBatch != nil {
+		if bp.abortBatchesIfPoisoned() {
+			continue
+		}
 		select {
 		case response := <-bp.responses:
 			bp.handleResponse(response)
@@ -1227,6 +1282,9 @@ func (bp *brokerProducer) shutdown() {
 	}
 	// then flush the current buffer
 	for !bp.accumulatingBatch.empty() || bp.flushingBatch != nil {
+		if bp.abortBatchesIfPoisoned() {
+			continue
+		}
 		if bp.flushingBatch == nil {
 			bp.tryBuildFlushingBatch()
 		}
@@ -1269,6 +1327,10 @@ func (bp *brokerProducer) waitForSpace(msg *ProducerMessage, forceRollover bool)
 	}
 
 	for {
+		if bp.parent.poisoned.Load() {
+			return ErrShuttingDown
+		}
+
 		if !bp.accumulatingBatch.wouldOverflow(msg) && !forceRollover {
 			return nil
 		}
@@ -1346,6 +1408,11 @@ func (bp *brokerProducer) handleSuccess(sent *produceSet, response *ProduceRespo
 
 		block := response.GetBlock(topic, partition)
 		if block == nil {
+			if !bp.parent.conf.Producer.Idempotent {
+				if bp.parent.poisoned.CompareAndSwap(false, true) {
+					Logger.Printf("producer/broker/%d state change to [poisoned] on %s/%d because produce response is incomplete\n", bp.broker.ID(), topic, partition)
+				}
+			}
 			bp.parent.returnErrors(pSet.msgs, ErrIncompleteResponse)
 			return
 		}
@@ -1369,6 +1436,11 @@ func (bp *brokerProducer) handleSuccess(sent *produceSet, response *ProduceRespo
 		case ErrInvalidMessage, ErrUnknownTopicOrPartition, ErrLeaderNotAvailable, ErrNotLeaderForPartition,
 			ErrRequestTimedOut, ErrNotEnoughReplicas, ErrNotEnoughReplicasAfterAppend, ErrKafkaStorageError:
 			if bp.parent.conf.Producer.Retry.Max <= 0 {
+				if !bp.parent.conf.Producer.Idempotent {
+					if bp.parent.poisoned.CompareAndSwap(false, true) {
+						Logger.Printf("producer/broker/%d state change to [poisoned] on %s/%d because retriable produce error occurred with retries disabled: %v\n", bp.broker.ID(), topic, partition, block.Err)
+					}
+				}
 				bp.parent.abandonBrokerConnection(bp)
 				bp.parent.returnErrors(pSet.msgs, block.Err)
 			} else {
@@ -1380,6 +1452,11 @@ func (bp *brokerProducer) handleSuccess(sent *produceSet, response *ProduceRespo
 			}
 		// Other non-retriable errors
 		default:
+			if !bp.parent.conf.Producer.Idempotent {
+				if bp.parent.poisoned.CompareAndSwap(false, true) {
+					Logger.Printf("producer/broker/%d state change to [poisoned] on %s/%d because produce failed with non-retriable error: %v\n", bp.broker.ID(), topic, partition, block.Err)
+				}
+			}
 			if bp.parent.conf.Producer.Retry.Max <= 0 {
 				bp.parent.abandonBrokerConnection(bp)
 			}
@@ -1410,7 +1487,8 @@ func (bp *brokerProducer) handleSuccess(sent *produceSet, response *ProduceRespo
 					leader, leaderErr := bp.parent.client.Leader(topic, partition)
 					leaderChanged = leaderErr == nil && leader != nil && leader.ID() != bp.broker.ID()
 				}
-				if bp.parent.conf.Producer.Idempotent || leaderChanged {
+				dropped := bp.accumulatingBatch.dropPartition(topic, partition)
+				if bp.parent.conf.Producer.Idempotent || leaderChanged || len(dropped) > 0 {
 					if bp.currentRetries[topic] == nil {
 						bp.currentRetries[topic] = make(map[int32]error)
 					}
@@ -1419,11 +1497,9 @@ func (bp *brokerProducer) handleSuccess(sent *produceSet, response *ProduceRespo
 				if leaderChanged {
 					bp.parent.abandonBrokerConnection(bp)
 				}
-				go bp.parent.retryBatch(topic, partition, pSet, block.Err, true)
-				if bp.parent.conf.Producer.Idempotent {
-					// dropping the following messages has the side effect of incrementing their retry count
-					bp.parent.retryMessages(bp.accumulatingBatch.dropPartition(topic, partition), block.Err)
-				}
+				go bp.parent.retryBatch(topic, partition, pSet, block.Err)
+				// dropping the following messages has the side effect of incrementing their retry count
+				bp.parent.retryMessages(dropped, block.Err)
 			}
 		})
 	}
@@ -1438,20 +1514,26 @@ func (bp *brokerProducer) handleSuccess(sent *produceSet, response *ProduceRespo
 	bp.parent.muter.unmute(unmuteSet)
 }
 
-func (p *asyncProducer) retryBatch(topic string, partition int32, pSet *partitionSet, retryErr error, alreadyMuted bool) {
+func (p *asyncProducer) retryBatch(topic string, partition int32, pSet *partitionSet, retryErr error) {
 	Logger.Printf("Retrying batch for %v-%d because of %v\n", topic, partition, retryErr)
 	produceSet := newProduceSet(p)
 	produceSet.msgs[topic] = make(map[int32]*partitionSet)
 	produceSet.msgs[topic][partition] = pSet
 	produceSet.bufferBytes += pSet.bufferBytes
 	produceSet.bufferCount += len(pSet.msgs)
+	if p.poisoned.Load() {
+		p.returnErrors(pSet.msgs, ErrShuttingDown)
+		p.muter.unmute(produceSet)
+		return
+	}
 	retryAttempt := 0
 	for _, msg := range pSet.msgs {
 		if msg.retries >= p.conf.Producer.Retry.Max {
-			p.returnErrors(pSet.msgs, retryErr)
-			if alreadyMuted {
-				p.muter.unmute(produceSet)
+			if !p.conf.Producer.Idempotent && p.poisoned.CompareAndSwap(false, true) {
+				Logger.Printf("producer state change to [poisoned] on %s/%d because retry batch exhausted retries: %v\n", topic, partition, retryErr)
 			}
+			p.returnErrors(pSet.msgs, retryErr)
+			p.muter.unmute(produceSet)
 			return
 		}
 		msg.retries++
@@ -1465,31 +1547,39 @@ func (p *asyncProducer) retryBatch(topic string, partition int32, pSet *partitio
 	leader, leaderErr := p.client.Leader(topic, partition)
 	if leaderErr != nil {
 		Logger.Printf("Failed retrying batch for %v-%d because of %v while looking up for new leader\n", topic, partition, leaderErr)
+		if !p.conf.Producer.Idempotent && p.poisoned.CompareAndSwap(false, true) {
+			Logger.Printf("producer state change to [poisoned] on %s/%d because retry batch leader lookup failed after %v: %v\n", topic, partition, retryErr, leaderErr)
+		}
 		for _, msg := range pSet.msgs {
 			p.returnError(msg, retryErr)
 		}
-		if alreadyMuted {
-			p.muter.unmute(produceSet)
-		}
+		p.muter.unmute(produceSet)
 		return
 	}
-	if !alreadyMuted {
-		if !p.muter.waitUntilMuted(produceSet) {
-			for _, msg := range pSet.msgs {
-				p.returnError(msg, retryErr)
-			}
-			return
-		}
+	if p.poisoned.Load() {
+		p.returnErrors(pSet.msgs, ErrShuttingDown)
+		p.muter.unmute(produceSet)
+		return
 	}
 	bp := p.getBrokerProducer(leader)
 	defer p.unrefBrokerProducer(leader, bp)
 
+	if p.poisoned.Load() {
+		p.returnErrors(pSet.msgs, ErrShuttingDown)
+		p.muter.unmute(produceSet)
+		return
+	}
 	select {
 	case bp.output <- produceSet:
 		return
 	default:
 	}
 
+	if p.poisoned.Load() {
+		p.returnErrors(pSet.msgs, ErrShuttingDown)
+		p.muter.unmute(produceSet)
+		return
+	}
 	select {
 	case bp.output <- produceSet:
 		return
@@ -1504,6 +1594,11 @@ func (p *asyncProducer) retryBatch(topic string, partition int32, pSet *partitio
 func (bp *brokerProducer) handleError(sent *produceSet, err error) {
 	var target PacketEncodingError
 	if errors.As(err, &target) {
+		if !bp.parent.conf.Producer.Idempotent {
+			if bp.parent.poisoned.CompareAndSwap(false, true) {
+				Logger.Printf("producer/broker/%d state change to [poisoned] because produce request encoding failed: %v\n", bp.broker.ID(), err)
+			}
+		}
 		sent.eachPartition(func(topic string, partition int32, pSet *partitionSet) {
 			bp.parent.returnErrors(pSet.msgs, err)
 		})
@@ -1539,7 +1634,7 @@ func (bp *brokerProducer) handleError(sent *produceSet, err error) {
 				keepMuted[topic] = make(map[int32]struct{})
 			}
 			keepMuted[topic][partition] = struct{}{}
-			go bp.parent.retryBatch(topic, partition, pSet, err, true)
+			go bp.parent.retryBatch(topic, partition, pSet, err)
 		})
 		bp.accumulatingBatch.eachPartition(func(topic string, partition int32, pSet *partitionSet) {
 			bp.parent.retryMessages(pSet.msgs, err)
@@ -1613,6 +1708,11 @@ func (p *asyncProducer) retryHandler() {
 			default:
 				buf.Remove()
 				currentByteSize -= int64(msgToHandle.ByteSize(version))
+				if !p.conf.Producer.Idempotent {
+					if p.poisoned.CompareAndSwap(false, true) {
+						Logger.Printf("producer state change to [poisoned] on %s/%d because retry buffer overflowed\n", msgToHandle.Topic, msgToHandle.Partition)
+					}
+				}
 				p.returnError(msgToHandle, ErrProducerRetryBufferOverflow)
 			}
 		}
@@ -1701,6 +1801,15 @@ func (p *asyncProducer) returnErrors(batch []*ProducerMessage, err error) {
 	}
 }
 
+func (p *asyncProducer) returnProduceSetErrors(set *produceSet, err error) {
+	if set == nil {
+		return
+	}
+	set.eachPartition(func(_ string, _ int32, pSet *partitionSet) {
+		p.returnErrors(pSet.msgs, err)
+	})
+}
+
 func (p *asyncProducer) returnSuccesses(batch []*ProducerMessage) {
 	for _, msg := range batch {
 		if p.conf.Producer.Return.Successes {
@@ -1712,7 +1821,24 @@ func (p *asyncProducer) returnSuccesses(batch []*ProducerMessage) {
 }
 
 func (p *asyncProducer) retryMessage(msg *ProducerMessage, err error) {
+	if p.poisoned.Load() {
+		if msg.flags&fin == fin {
+			p.inFlight.Done()
+		} else {
+			p.returnError(msg, ErrShuttingDown)
+		}
+		return
+	}
 	if msg.retries >= p.conf.Producer.Retry.Max {
+		if msg.flags&fin == fin {
+			p.inFlight.Done()
+			return
+		}
+		if !p.conf.Producer.Idempotent {
+			if p.poisoned.CompareAndSwap(false, true) {
+				Logger.Printf("producer state change to [poisoned] on %s/%d because message exhausted retries: %v\n", msg.Topic, msg.Partition, err)
+			}
+		}
 		p.returnError(msg, err)
 	} else {
 		msg.retries++
