@@ -803,7 +803,9 @@ func (pp *partitionProducer) updateLeaderIfBrokerProducerIsNil(msg *ProducerMess
 	if pp.brokerProducer == nil {
 		if err := pp.updateLeader(); err != nil {
 			if !pp.parent.conf.Producer.Idempotent {
-				pp.parent.poisoned.Store(true)
+				if pp.parent.poisoned.CompareAndSwap(false, true) {
+					Logger.Printf("producer state change to [poisoned] on %s/%d because leader update failed: %v\n", pp.topic, pp.partition, err)
+				}
 			}
 			pp.parent.returnError(msg, err)
 			pp.backoff(msg.retries)
@@ -930,7 +932,9 @@ func (pp *partitionProducer) flushRetryBuffers() {
 		if pp.brokerProducer == nil {
 			if err := pp.updateLeader(); err != nil {
 				if !pp.parent.conf.Producer.Idempotent && len(pp.retryState[pp.highWatermark].buf) > 0 {
-					pp.parent.poisoned.Store(true)
+					if pp.parent.poisoned.CompareAndSwap(false, true) {
+						Logger.Printf("producer state change to [poisoned] on %s/%d because retry buffer leader update failed: %v\n", pp.topic, pp.partition, err)
+					}
 				}
 				pp.parent.returnErrors(pp.retryState[pp.highWatermark].buf, err)
 				goto flushDone
@@ -1405,7 +1409,9 @@ func (bp *brokerProducer) handleSuccess(sent *produceSet, response *ProduceRespo
 		block := response.GetBlock(topic, partition)
 		if block == nil {
 			if !bp.parent.conf.Producer.Idempotent {
-				bp.parent.poisoned.Store(true)
+				if bp.parent.poisoned.CompareAndSwap(false, true) {
+					Logger.Printf("producer/broker/%d state change to [poisoned] on %s/%d because produce response is incomplete\n", bp.broker.ID(), topic, partition)
+				}
 			}
 			bp.parent.returnErrors(pSet.msgs, ErrIncompleteResponse)
 			return
@@ -1431,7 +1437,9 @@ func (bp *brokerProducer) handleSuccess(sent *produceSet, response *ProduceRespo
 			ErrRequestTimedOut, ErrNotEnoughReplicas, ErrNotEnoughReplicasAfterAppend, ErrKafkaStorageError:
 			if bp.parent.conf.Producer.Retry.Max <= 0 {
 				if !bp.parent.conf.Producer.Idempotent {
-					bp.parent.poisoned.Store(true)
+					if bp.parent.poisoned.CompareAndSwap(false, true) {
+						Logger.Printf("producer/broker/%d state change to [poisoned] on %s/%d because retriable produce error occurred with retries disabled: %v\n", bp.broker.ID(), topic, partition, block.Err)
+					}
 				}
 				bp.parent.abandonBrokerConnection(bp)
 				bp.parent.returnErrors(pSet.msgs, block.Err)
@@ -1445,7 +1453,9 @@ func (bp *brokerProducer) handleSuccess(sent *produceSet, response *ProduceRespo
 		// Other non-retriable errors
 		default:
 			if !bp.parent.conf.Producer.Idempotent {
-				bp.parent.poisoned.Store(true)
+				if bp.parent.poisoned.CompareAndSwap(false, true) {
+					Logger.Printf("producer/broker/%d state change to [poisoned] on %s/%d because produce failed with non-retriable error: %v\n", bp.broker.ID(), topic, partition, block.Err)
+				}
 			}
 			if bp.parent.conf.Producer.Retry.Max <= 0 {
 				bp.parent.abandonBrokerConnection(bp)
@@ -1519,7 +1529,9 @@ func (p *asyncProducer) retryBatch(topic string, partition int32, pSet *partitio
 	retryAttempt := 0
 	for _, msg := range pSet.msgs {
 		if msg.retries >= p.conf.Producer.Retry.Max {
-			p.poisoned.Store(true)
+			if !p.conf.Producer.Idempotent && p.poisoned.CompareAndSwap(false, true) {
+				Logger.Printf("producer state change to [poisoned] on %s/%d because retry batch exhausted retries: %v\n", topic, partition, retryErr)
+			}
 			p.returnErrors(pSet.msgs, retryErr)
 			p.muter.unmute(produceSet)
 			return
@@ -1535,7 +1547,9 @@ func (p *asyncProducer) retryBatch(topic string, partition int32, pSet *partitio
 	leader, leaderErr := p.client.Leader(topic, partition)
 	if leaderErr != nil {
 		Logger.Printf("Failed retrying batch for %v-%d because of %v while looking up for new leader\n", topic, partition, leaderErr)
-		p.poisoned.Store(true)
+		if !p.conf.Producer.Idempotent && p.poisoned.CompareAndSwap(false, true) {
+			Logger.Printf("producer state change to [poisoned] on %s/%d because retry batch leader lookup failed after %v: %v\n", topic, partition, retryErr, leaderErr)
+		}
 		for _, msg := range pSet.msgs {
 			p.returnError(msg, retryErr)
 		}
@@ -1581,7 +1595,9 @@ func (bp *brokerProducer) handleError(sent *produceSet, err error) {
 	var target PacketEncodingError
 	if errors.As(err, &target) {
 		if !bp.parent.conf.Producer.Idempotent {
-			bp.parent.poisoned.Store(true)
+			if bp.parent.poisoned.CompareAndSwap(false, true) {
+				Logger.Printf("producer/broker/%d state change to [poisoned] because produce request encoding failed: %v\n", bp.broker.ID(), err)
+			}
 		}
 		sent.eachPartition(func(topic string, partition int32, pSet *partitionSet) {
 			bp.parent.returnErrors(pSet.msgs, err)
@@ -1693,7 +1709,9 @@ func (p *asyncProducer) retryHandler() {
 				buf.Remove()
 				currentByteSize -= int64(msgToHandle.ByteSize(version))
 				if !p.conf.Producer.Idempotent {
-					p.poisoned.Store(true)
+					if p.poisoned.CompareAndSwap(false, true) {
+						Logger.Printf("producer state change to [poisoned] on %s/%d because retry buffer overflowed\n", msgToHandle.Topic, msgToHandle.Partition)
+					}
 				}
 				p.returnError(msgToHandle, ErrProducerRetryBufferOverflow)
 			}
@@ -1817,7 +1835,9 @@ func (p *asyncProducer) retryMessage(msg *ProducerMessage, err error) {
 			return
 		}
 		if !p.conf.Producer.Idempotent {
-			p.poisoned.Store(true)
+			if p.poisoned.CompareAndSwap(false, true) {
+				Logger.Printf("producer state change to [poisoned] on %s/%d because message exhausted retries: %v\n", msg.Topic, msg.Partition, err)
+			}
 		}
 		p.returnError(msg, err)
 	} else {
